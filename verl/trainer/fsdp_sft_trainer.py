@@ -519,7 +519,7 @@ class FSDPSFTTrainer:
             step_loss /= self.device_mesh.size(0)
         return {
             "train/loss": step_loss.detach().item(),
-            "train/lr(1e-3)": lr * 1e3,
+            "train/lr": lr,
             "train/time(s)": spend_time_per_step,
         }
 
@@ -746,6 +746,10 @@ class FSDPSFTTrainer:
         start_epoch = global_step // self.steps_per_epoch
 
         train_time = 0
+        if self.config.trainer.save_freq == "after_each_epoch":
+            self.config.trainer.save_freq = self.steps_per_epoch
+        if self.config.trainer.test_freq == "after_each_epoch":
+            self.config.trainer.test_freq = self.steps_per_epoch
         for epoch in range(start_epoch, self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
 
