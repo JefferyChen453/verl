@@ -19,7 +19,7 @@ Core components:
 1. Teacher signal: top-k log-probabilities and token indices per valid token position.
 2. Student objective: sparse, token-level KL divergence between student logits and teacher top-k distribution.
 
-Objective: encourage student probabilities $Q$ to cover teacher modes $P$ using token-wise $\mathrm{KL}(P\,\|\,Q)$ computed on the teacher's top-k support.
+Objective: encourage student probabilities $Q$ to cover teacher modes $P$ using token-wise $\mathrm{KL}(PQ)$ computed on the teacher's top-k support.
 
 ## 3. Efficient System Design
 
@@ -27,13 +27,13 @@ Objective: encourage student probabilities $Q$ to cover teacher modes $P$ using 
 
 The native (serial) on-policy distillation process is shown in the figure below.
 
-![Zero-Step-Off Scheduler](https://raw.githubusercontent.com/eric-haibin-lin/verl-community/refs/heads/main/docs/zero-step-off-distill.png)
+Zero-Step-Off Scheduler
 
 This recipe supports optional schedulers that overlap generation, teacher querying, and updates to improve throughput without changing the distillation objective.
 
 #### 3.1.1 One-Step-Off-Policy
 
-![One-Step-Off Scheduler](https://raw.githubusercontent.com/eric-haibin-lin/verl-community/refs/heads/main/docs/one-step-off-distill.png)
+One-Step-Off Scheduler
 
 - Warm-up: 2 steps.
 - Overlap pattern: rollout while actor update; weight sync while teacher retrieving.
@@ -41,7 +41,7 @@ This recipe supports optional schedulers that overlap generation, teacher queryi
 
 #### 3.1.2 Two-Step-Off-Policy
 
-![Two-Step-Off Scheduler](https://raw.githubusercontent.com/eric-haibin-lin/verl-community/refs/heads/main/docs/two-step-off-distill.png)
+Two-Step-Off Scheduler
 
 - Warm-up: 3 steps.
 - Overlap pattern: rollout, actor update while teacher retrieving; interleave weight sync.
@@ -97,33 +97,40 @@ Driver (TaskRunner)
 ## 5. Key Components
 
 ### 5.1 `OnPolicyDistillTrainer` (`ray_trainer.py`)
+
 - Creates `GenerationBatchFuture` objects holding rollout and (later) teacher futures.
 - Adds scheduling + teacher integration + modified metric emission (KL, timing, MFU).
 
 ### 5.2 Actor Worker (Megatron)
+
 - `OnPolicyDistillActor.update_policy()` orchestrates micro-batch forward/backward.
 - KL Loss injection via `logits_processor` during forward on pipeline last stage.
 
 ### 5.3 Rollout Worker (vLLM / SGLang)
+
 - Pure inference mode (`init_model` builds model; no optimizer). 
 - `async_generate_sequences` returns a Ray future for overlapping.
 
 ### 5.4 Teacher Service (`teacher/`)
+
 - Proxy + worker architecture (ZMQ REQ/REP) for batched top-k retrieval.
 - `TeacherClient.submit()` returns a `Future`; aggregator composes micro-batches.
 - Configurable temperature, max tokens, only-response mode.
 
 ### 5.5 KL Loss (`megatron_kl_loss.py`)
+
 - Performs normalization & stable per-token probability construction across TP shards.
 - Gradient is (student_probs - teacher_sparse_probs) scaled by upstream grad.
 
 ## 6. Configuration Highlights (`on_policy_distill_trainer.yaml`)
 
-| Section | Purpose | Notable Keys |
-|---------|---------|-------------|
-| actor_rollout_ref.teacher | Teacher server | server_ip, server_port, n_server_workers |
-| trainer | Global training control | total_epochs, save_freq, scheduler (one_step_off | two_step_off), n_gpus_per_node, nnodes |
-| rollout | Resource split for rollout | n_gpus_per_node, nnodes |
+
+| Section                   | Purpose                    | Notable Keys                                     |
+| ------------------------- | -------------------------- | ------------------------------------------------ |
+| actor_rollout_ref.teacher | Teacher server             | server_ip, server_port, n_server_workers         |
+| trainer                   | Global training control    | total_epochs, save_freq, scheduler (one_step_off |
+| rollout                   | Resource split for rollout | n_gpus_per_node, nnodes                          |
+
 
 **Remember to set `trainer.n_gpus_per_node`, `trainer.nnodes`, `rollout.n_gpus_per_node` and `rollout.nnodes` to allocate GPU resources.**
 
@@ -224,12 +231,14 @@ Interpretation Tips:
 
 ## 10. Functional Support Summary
 
-| Category | Supported |
-|----------|-----------|
-| Train engine | Megatron |
-| Rollout engine | vLLM |
+
+| Category            | Supported                        |
+| ------------------- | -------------------------------- |
+| Train engine        | Megatron                         |
+| Rollout engine      | vLLM                             |
 | Distillation signal | Teacher top-k logprobs & indices |
-| Scheduling | one_step_off, two_step_off |
+| Scheduling          | one_step_off, two_step_off       |
+
 
 ## 11. Quick Checklist Before Running
 
@@ -239,4 +248,5 @@ Interpretation Tips:
 - NCCL environment vars set (see `config/runtime_env.yaml`).
 
 ---
+
 Feel free to open issues or PRs to extend scheduler variants, add new distillation objectives, or broaden engine support, and more improvement.
