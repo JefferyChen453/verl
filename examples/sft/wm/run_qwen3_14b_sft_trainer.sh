@@ -20,8 +20,8 @@ DATA_DIR=/home/tianyichen/llm_watermark/verl/data
 
 torchrun --standalone --nnodes=1 --nproc_per_node=8 \
     -m verl.trainer.sft_trainer \
-    data.train_files=$DATA_DIR/sft/Qwen-Qwen3-32B_LFQA_filtered_data_pos_3566_neg_1562.parquet \
-    data.val_files=$DATA_DIR/sft/Qwen-Qwen3-32B_LFQA_filtered_data_pos_3566_neg_1562.parquet \
+    data.train_files=$DATA_DIR/sft_modified_loss/vblagoje_lfqa/Qwen-Qwen3-14B_strength_4.0_filtered_pos_3592_neg_0.parquet \
+    data.val_files=$DATA_DIR/sft_modified_loss/vblagoje_lfqa/validation_177.parquet \
     data.val_max_samples=32 \
     +data.prompt_key=prompt \
     +data.response_key=response \
@@ -45,11 +45,11 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
     engine.reshard_after_forward=true \
     engine.forward_prefetch=true \
     trainer.project_name=watermark-sft \
-    trainer.experiment_name=lfqa-frac0.1-0.4-qwen3-14b \
+    trainer.experiment_name=vblagoje_lfqa_sft \
     trainer.total_epochs=3 \
     'trainer.logger=[console,wandb]' \
     trainer.save_freq=after_each_epoch \
-    trainer.test_freq=50 \
+    trainer.test_freq=500 \
     'checkpoint.save_contents=[model,optimizer,extra]' \
     optim.lr=1e-5 \
     engine.ulysses_sequence_parallel_size=2 \
