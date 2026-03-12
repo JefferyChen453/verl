@@ -186,6 +186,12 @@ class vLLMAsyncRollout(BaseRollout):
             else int(ray.get_runtime_context().get_accelerator_ids()[device_name][0])
         )
         self.vllm_config = all_kwargs[0]["vllm_config"]
+        # Each external ZMQ worker owns exactly 1 GPU; make local_world_size=1 so
+        # vLLM's init_device assertion (local_world_size <= visible_device_count) passes.
+        # local_world_size is a read-only property (world_size // nnodes_within_dp).
+        # Setting nnodes = world_size gives nnodes_within_dp = world_size => local_world_size = 1,
+        # while preserving world_size (= tensor_parallel_size) for correct TP model init.
+        self.vllm_config.parallel_config.nnodes = self.vllm_config.parallel_config.world_size
         if self.lora_config:
             lora_dtype = getattr(torch, self.config.dtype)
             self.vllm_config.lora_config = LoRAConfig(lora_dtype=lora_dtype, **self.lora_config)
@@ -196,7 +202,7 @@ class vLLMAsyncRollout(BaseRollout):
                 apply_vllm_fp8_patches()
             else:
                 raise ValueError(f"Currently only support fp8 quantization, got: {self.config.quantization}")
-        self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
+        self.inference_engine = WorkerWrapperBase(rpc_rank=0)
         self.inference_engine.init_worker(all_kwargs)
 
     def _load_model(self, *args, **kwargs):

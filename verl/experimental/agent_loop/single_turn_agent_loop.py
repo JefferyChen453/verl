@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import json
 import logging
 import os
 from typing import Any
@@ -22,6 +23,23 @@ from verl.utils.profiler import simple_timer
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+_DEBUG_VALIDATE_PROMPT_PRINT_COUNT = 0
+
+
+def _format_debug_text(text: str, max_chars: int = 4000) -> str:
+    if len(text) <= max_chars:
+        return text
+    head = max_chars // 2
+    tail = max_chars - head
+    omitted = len(text) - max_chars
+    return f"{text[:head]}\n...<omitted {omitted} chars>...\n{text[-tail:]}"
+
+
+def _format_debug_ids(token_ids: list[int], edge: int = 32) -> str:
+    if len(token_ids) <= edge * 2:
+        return str(token_ids)
+    return f"{token_ids[:edge]} ... {token_ids[-edge:]}"
 
 
 @register("single_turn_agent")
@@ -35,8 +53,12 @@ class SingleTurnAgentLoop(AgentLoopBase):
         self.apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+        global _DEBUG_VALIDATE_PROMPT_PRINT_COUNT
+
         messages = list(kwargs["raw_prompt"])
         image_data = copy.deepcopy((kwargs.get("multi_modal_data") or {}).get("image", None))
+        validate = bool(kwargs.get("validate", False))
+        uid = kwargs.get("uid")
 
         metrics = {}
         request_id = uuid4().hex
@@ -62,9 +84,44 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 ),
             )
 
+        if validate and _DEBUG_VALIDATE_PROMPT_PRINT_COUNT < 2:
+            raw_prompt_text = json.dumps(messages, ensure_ascii=False, indent=2)
+            decoded_prompt = await self.loop.run_in_executor(
+                None, lambda: self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+            )
+            print(
+                "[WMKD DEBUG][single_turn_agent] "
+                f"uid={uid} request_id={request_id} prompt_tokens={len(prompt_ids)}",
+                flush=True,
+            )
+            print(
+                "[WMKD DEBUG][single_turn_agent] "
+                f"prompt_token_ids={_format_debug_ids(prompt_ids)}",
+                flush=True,
+            )
+            print(
+                "[WMKD DEBUG][single_turn_agent] "
+                f"raw_prompt_messages=\n{_format_debug_text(raw_prompt_text)}",
+                flush=True,
+            )
+            print(
+                "[WMKD DEBUG][single_turn_agent] "
+                f"rebuilt_prompt=\n{_format_debug_text(decoded_prompt)}",
+                flush=True,
+            )
+            _DEBUG_VALIDATE_PROMPT_PRINT_COUNT += 1
+
+        request_sampling_params = dict(sampling_params)
+        if validate:
+            request_sampling_params["_verl_debug_validate"] = True
+            request_sampling_params["_verl_debug_uid"] = uid
+
         with simple_timer("generate_sequences", metrics):
             output = await self.server_manager.generate(
-                request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params, image_data=image_data
+                request_id=request_id,
+                prompt_ids=prompt_ids,
+                sampling_params=request_sampling_params,
+                image_data=image_data,
             )
         response_mask = [1] * len(output.token_ids)
 
