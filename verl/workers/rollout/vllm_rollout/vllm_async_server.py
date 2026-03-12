@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+from concurrent.futures import Future
 from pprint import pprint
 from typing import Any, Callable, Optional
 
@@ -35,7 +36,11 @@ from vllm.inputs import TokensPrompt
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
-from vllm.utils import FlexibleArgumentParser, get_tcp_uri
+try:
+    from vllm.utils import FlexibleArgumentParser, get_tcp_uri
+except ImportError:
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+    from vllm.utils.network_utils import get_tcp_uri
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
@@ -116,6 +121,26 @@ class ExternalZeroMQDistributedExecutor(Executor):
             if isinstance(output, Exception):
                 raise output
         return outputs
+
+    def execute_model(self, scheduler_output, non_block=False):
+        # ZMQ collective_rpc is always synchronous; wrap in a resolved Future when non_block=True
+        # so that callers expecting a Future (vLLM EngineCore v1) get one.
+        result = self.collective_rpc("execute_model", args=(scheduler_output,))
+        output = result[0]
+        if non_block:
+            future: Future = Future()
+            future.set_result(output)
+            return future
+        return output
+
+    def sample_tokens(self, grammar_output, non_block=False):
+        result = self.collective_rpc("sample_tokens", args=(grammar_output,))
+        output = result[0]
+        if non_block:
+            future: Future = Future()
+            future.set_result(output)
+            return future
+        return output
 
     def check_health(self):
         return
@@ -344,21 +369,26 @@ class vLLMHttpServerBase:
     async def run_server(self, args: argparse.Namespace):
         engine_args = AsyncEngineArgs.from_cli_args(args)
         usage_context = UsageContext.OPENAI_API_SERVER
+        # Allow max_model_len to exceed max_position_embeddings when context extension
+        # (e.g. YaRN) is in use.  Must be set before create_engine_config() runs the check.
+        if engine_args.max_model_len and engine_args.max_model_len > 0:
+            os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
         vllm_config.parallel_config.data_parallel_master_port = self._dp_master_port
 
         engine_client = AsyncLLM.from_vllm_config(
             vllm_config=vllm_config,
             usage_context=usage_context,
-            disable_log_requests=engine_args.disable_log_requests,
+            enable_log_requests=not getattr(engine_args, "disable_log_requests", True),
             disable_log_stats=engine_args.disable_log_stats,
         )
 
         # Don't keep the dummy data in memory
         await engine_client.reset_mm_cache()
 
-        app = build_app(args)
-        await init_app_state(engine_client, vllm_config, app.state, args)
+        supported_tasks = await engine_client.get_supported_tasks()
+        app = build_app(args, supported_tasks)
+        await init_app_state(engine_client, app.state, args, supported_tasks)
         if self.replica_rank == 0 and self.node_rank == 0:
             logger.info(f"Initializing a V1 LLM engine with config: {vllm_config}")
 
