@@ -67,6 +67,14 @@ class WatermarkDistillTrainer:
         self._build_ckpt_handler()
 
         self._green_mask_cache: dict[tuple[int, float], torch.Tensor] = {}
+        self._debug_first_step = True
+
+        if self.engine.ulysses_device_mesh is not None:
+            from verl.utils.ulysses import set_ulysses_sequence_parallel_group
+
+            set_ulysses_sequence_parallel_group(
+                self.engine.ulysses_device_mesh["sp"].get_group()
+            )
 
         self.resume_global_step = self.ckpt_handler.load_checkpoint()
         self.device_name = self.config.trainer.device
@@ -358,11 +366,20 @@ class WatermarkDistillTrainer:
 
         tu.assign_non_tensor(data, sp_size=sp_size)
 
+        local_num_tokens = data["loss_mask"].values().sum().item() if data["loss_mask"].is_nested else data["loss_mask"].sum().item()
         batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
         torch.distributed.all_reduce(
             batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.engine.get_data_parallel_group(),
         )
         batch_num_tokens_val = batch_num_tokens.item()
+        if self._debug_first_step and self.rank == 0:
+            lm = data["loss_mask"]
+            print(f"[DEBUG batch] local_num_tokens={local_num_tokens}, "
+                  f"is_nested={lm.is_nested}, "
+                  f"shape={lm.shape if not lm.is_nested else 'nested'}, "
+                  f"values_shape={lm.values().shape if lm.is_nested else 'N/A'}, "
+                  f"values_sum={lm.values().sum().item() if lm.is_nested else lm.sum().item()}, "
+                  f"values_dtype={lm.values().dtype if lm.is_nested else lm.dtype}")
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens_val)
         tu.assign_non_tensor(data, dp_size=self.engine.get_data_parallel_size())
 
@@ -372,6 +389,7 @@ class WatermarkDistillTrainer:
 
         all_metrics = []
         self.engine.optimizer_zero_grad()
+        self.engine.module.train()
 
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
@@ -392,19 +410,35 @@ class WatermarkDistillTrainer:
             sample_index = self._build_sample_index(offsets, chunk_len, sp_size, pad_size)
             sample_index = sample_index.to(get_device_id())
 
-            with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
-                actor_raw_output = self.engine.module(**model_inputs, use_cache=False)
-                actor_logits = actor_raw_output.logits.squeeze(0)  # (chunk_len, V)
+            # Roll loss_mask on full sequence BEFORE SP slicing (matches input_ids_rolled)
+            raw_lm = micro_batch["loss_mask"]
+            raw_values = raw_lm.values() if raw_lm.is_nested else raw_lm
+            loss_mask_flat = raw_values.float()
+            loss_mask_flat = torch.roll(loss_mask_flat, shifts=-1, dims=0)
 
+            if sp_size > 1:
+                loss_mask_flat = self._slice_loss_mask_for_sp(loss_mask_flat, pad_size)
+
+            if self._debug_first_step and self.rank == 0:
+                from verl.utils.ulysses import get_ulysses_sequence_parallel_rank, get_ulysses_sequence_parallel_world_size
+                print(f"[DEBUG micro] raw sum={raw_values.sum().item()}, "
+                      f"rolled sum={raw_values.float().roll(-1,0).sum().item()}, "
+                      f"sp_rank={get_ulysses_sequence_parallel_rank()}, "
+                      f"sp_ws={get_ulysses_sequence_parallel_world_size()}, "
+                      f"after SP slice: sum={loss_mask_flat.sum().item()}, shape={loss_mask_flat.shape}, "
+                      f"nonzero_positions={raw_values.nonzero().squeeze().tolist()[:5]}...")
+
+            with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
+                # Run ref first (no_grad) so its activations are freed before actor forward.
+                # This avoids holding both models' activations at once (~2x activation memory).
                 with torch.no_grad():
                     ref_raw_output = self.ref_model(**model_inputs, use_cache=False)
                     ref_logits = ref_raw_output.logits.squeeze(0).detach()  # (chunk_len, V)
 
-                input_ids_rolled = output_args["input_ids_rmpad_rolled"]
-                loss_mask_flat = micro_batch["loss_mask"].values()
+                actor_raw_output = self.engine.module(**model_inputs, use_cache=False)
+                actor_logits = actor_raw_output.logits.squeeze(0)  # (chunk_len, V)
 
-                if sp_size > 1:
-                    loss_mask_flat = self._slice_loss_mask_for_sp(loss_mask_flat, pad_size)
+                input_ids_rolled = output_args["input_ids_rmpad_rolled"]
 
                 loss, metrics = compute_watermark_distill_loss(
                     actor_logits=actor_logits,
@@ -425,8 +459,16 @@ class WatermarkDistillTrainer:
 
                 loss.backward()
 
+            if self._debug_first_step and self.rank == 0:
+                print(f"[DEBUG step] batch_num_tokens={batch_num_tokens_val}, "
+                      f"loss_mask_flat sum={loss_mask_flat.sum().item()}, "
+                      f"actor_logits shape={tuple(actor_logits.shape)}, "
+                      f"actor_logits range=[{actor_logits.min().item():.4f}, {actor_logits.max().item():.4f}], "
+                      f"loss={loss.item():.6f}, metrics={metrics}")
+
             all_metrics.append(metrics)
 
+        self._debug_first_step = False
         grad_norm = self.engine.optimizer_step()
 
         agg = {}

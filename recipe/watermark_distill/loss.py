@@ -34,7 +34,7 @@ def compute_watermark_distill_loss(
         actor_logits:     (chunk_len, vocab_size) — with grad
         ref_logits:       (chunk_len, vocab_size) — detached, no grad
         input_ids_rolled: (chunk_len,) — left-shifted input ids (next-token labels)
-        loss_mask_flat:   (chunk_len,) — 1 on response tokens, 0 on prompt/padding
+        loss_mask_flat:   (chunk_len,) float — already rolled (left-shifted) and SP-sliced
         sample_index:     (chunk_len,) long — maps each token position to its sample idx
         green_masks:      (num_samples, vocab_size) bool — per-sample green-list masks
         strength:         scalar bias added to ref logits on green positions
@@ -46,11 +46,11 @@ def compute_watermark_distill_loss(
     Returns:
         (loss, metrics_dict)
     """
-    loss_mask = torch.roll(loss_mask_flat, shifts=-1, dims=0)
+    loss_mask = loss_mask_flat
     response_mask = loss_mask.bool()
     num_response = batch_num_tokens
 
-    # ---- L_CE: standard cross-entropy (global, no per-sample mask needed) ----
+    # ---- L_SFT ----
     log_probs_all = F.log_softmax(actor_logits, dim=-1)
     log_probs_target = log_probs_all.gather(dim=-1, index=input_ids_rolled.unsqueeze(-1)).squeeze(-1)
     l_ce = -torch.sum(log_probs_target * loss_mask) / num_response * dp_size
@@ -60,9 +60,9 @@ def compute_watermark_distill_loss(
 
     num_samples = green_masks.shape[0]
 
-    # ---- L_green: per-sample green token probability loss ----
+    # ---- L_green: green token probability loss ----
     if green_loss_weight > 0:
-        actor_probs = log_probs_all.exp()  # reuse log_probs_all to avoid recomputing softmax
+        actor_probs = log_probs_all.exp()
         l_green_total = torch.zeros(1, device=actor_logits.device, dtype=actor_logits.dtype)
         green_prob_sum = torch.zeros(1, device=actor_logits.device, dtype=actor_logits.dtype)
         response_count = torch.zeros(1, device=actor_logits.device, dtype=actor_logits.dtype)
@@ -88,7 +88,7 @@ def compute_watermark_distill_loss(
             avg_green_prob = green_prob_sum / response_count.clamp(min=1)
             metrics["avg_green_prob"] = avg_green_prob.item()
 
-    # ---- L_KL: per-sample KL with biased ref logits ----
+    # ---- KL(D_ref_biased || D_actor) ----
     if kl_loss_weight > 0:
         l_kl_total = torch.zeros(1, device=actor_logits.device, dtype=actor_logits.dtype)
 
