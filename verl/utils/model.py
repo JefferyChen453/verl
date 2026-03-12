@@ -64,7 +64,11 @@ def update_model_config(module_config, override_config_kwargs):
     """
     for key, val in override_config_kwargs.items():
         if isinstance(val, dict):
-            update_model_config(getattr(module_config, key), val)
+            config_dict = getattr(module_config, key)
+            if config_dict is not None:
+                update_model_config(config_dict, val)
+            else:
+                setattr(module_config, key, val)
         else:
             setattr(module_config, key, val)
 
