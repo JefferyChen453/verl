@@ -177,7 +177,6 @@ class RLHFDataset(Dataset):
         if self.filter_overlong_prompts:
             tokenizer = self.tokenizer
             processor = self.processor
-            prompt_key = self.prompt_key
             image_key = self.image_key
             video_key = self.video_key
 
@@ -186,15 +185,8 @@ class RLHFDataset(Dataset):
 
                 def doc2len(doc) -> int:
                     try:
-                        messages = self._build_messages(doc)
-                        # pass tool schemas if available so the processor can format prompts
-                        apply_kwargs = dict(**self.apply_chat_template_kwargs)
-                        if self.tool_schemas is not None:
-                            apply_kwargs["tools"] = self.tool_schemas
-
-                        raw_prompt = self.processor.apply_chat_template(
-                            messages, add_generation_prompt=True, tokenize=False, **apply_kwargs
-                        )
+                        prompt = self._get_prompt(doc, pop=False)
+                        raw_prompt = self._render_prompt(prompt)
                         if image_key in doc and doc[image_key]:
                             images = [
                                 process_image(image, image_patch_size=self.image_patch_size) for image in doc[image_key]
@@ -233,13 +225,9 @@ class RLHFDataset(Dataset):
 
                 def doc2len(doc) -> int:
                     try:
-                        apply_kwargs = dict(**self.apply_chat_template_kwargs)
-                        if self.tool_schemas is not None:
-                            apply_kwargs["tools"] = self.tool_schemas
-
-                        return len(
-                            tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True, **apply_kwargs)
-                        )
+                        prompt = self._get_prompt(doc, pop=False)
+                        raw_prompt = self._render_prompt(prompt)
+                        return len(tokenizer(raw_prompt, add_special_tokens=False)["input_ids"])
                     except Exception:
                         print("Error processing one of the samples, skipping...")
                         traceback.print_exc()
@@ -266,8 +254,13 @@ class RLHFDataset(Dataset):
     def __len__(self):
         return len(self.dataframe)
 
-    def _build_messages(self, example: dict):
-        messages: list = example.pop(self.prompt_key)
+    def _get_prompt(self, example: dict, pop: bool = True):
+        prompt = example.pop(self.prompt_key) if pop else example[self.prompt_key]
+
+        if isinstance(prompt, str):
+            return prompt
+
+        messages = copy.deepcopy(prompt)
 
         if self.image_key in example or self.video_key in example:
             for message in messages:
@@ -287,20 +280,36 @@ class RLHFDataset(Dataset):
 
         return messages
 
+    def _render_prompt(self, prompt):
+        if isinstance(prompt, str):
+            return prompt
+
+        apply_kwargs = dict(**self.apply_chat_template_kwargs)
+        if self.tool_schemas is not None:
+            apply_kwargs["tools"] = self.tool_schemas
+
+        if self.processor is not None:
+            return self.processor.apply_chat_template(prompt, add_generation_prompt=True, tokenize=False, **apply_kwargs)
+
+        if self.apply_chat_template_kwargs.get("chat_template") is None:
+            assert hasattr(self.tokenizer, "chat_template"), (
+                "chat_template should be provided in apply_chat_template_kwargs or tokenizer config, "
+                "models like GLM can copy chat_template.jinja from instruct models"
+            )
+        return self.tokenizer.apply_chat_template(prompt, add_generation_prompt=True, tokenize=False, **apply_kwargs)
+
     def __getitem__(self, item):
         """
         Note that we also return the raw_input_ids so that it can be combined with other chat template
         """
         row_dict: dict = self.dataframe[item]
-        messages = self._build_messages(row_dict)
+        prompt = self._get_prompt(row_dict)
+        raw_prompt = self._render_prompt(prompt)
         model_inputs = {}
 
         if self.processor is not None:
             from verl.utils.dataset.vision_utils import process_image, process_video
 
-            raw_prompt = self.processor.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs
-            )
             multi_modal_data = {}
 
             images = None
@@ -355,14 +364,6 @@ class RLHFDataset(Dataset):
                 row_dict["multi_modal_inputs"].pop("second_per_grid_ts", None)
 
         else:
-            if self.apply_chat_template_kwargs.get("chat_template") is None:
-                assert hasattr(self.tokenizer, "chat_template"), (
-                    "chat_template should be provided in apply_chat_template_kwargs or tokenizer config, "
-                    "models like GLM can copy chat_template.jinja from instruct models"
-                )
-            raw_prompt = self.tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs
-            )
             model_inputs = self.tokenizer(raw_prompt, return_tensors="pt", add_special_tokens=False)
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")
@@ -432,7 +433,7 @@ class RLHFDataset(Dataset):
         row_dict["raw_prompt_ids"] = raw_prompt_ids
         # encode prompts without chat template
         if self.return_raw_chat:
-            row_dict["raw_prompt"] = messages
+            row_dict["raw_prompt"] = prompt
 
         # get prompts with chat template
         if self.return_full_prompt:

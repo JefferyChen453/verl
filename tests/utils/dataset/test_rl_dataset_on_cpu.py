@@ -130,3 +130,46 @@ def test_image_rl_data():
     output = tokenizer.batch_decode([data])[0]
     print(f"type: type{output}")
     print(f"\n\noutput: {output}")
+
+
+def test_rl_dataset_with_preformatted_string_prompt(tmp_path):
+    import pandas as pd
+
+    from tests.special_e2e.envs.digit_completion.tokenizer import CharTokenizer
+    from verl.utils.dataset.rl_dataset import RLHFDataset
+
+    chat_template = (
+        "{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}"
+        "{% if add_generation_prompt %}assistant:{% endif %}"
+    )
+    tokenizer = CharTokenizer(
+        characters=list("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ: ?!\n"),
+        model_max_length=256,
+        chat_template=chat_template,
+    )
+
+    messages = [{"role": "user", "content": "Hello?"}]
+    formatted_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+    parquet_path = tmp_path / "preformatted_prompt.parquet"
+    pd.DataFrame([{"prompt": formatted_prompt, "data_source": "unit_test"}]).to_parquet(parquet_path)
+
+    config = OmegaConf.create(
+        {
+            "prompt_key": "prompt",
+            "max_prompt_length": 256,
+            "filter_overlong_prompts": True,
+            "filter_overlong_prompts_workers": None,
+            "return_full_prompt": True,
+        }
+    )
+    dataset = RLHFDataset(data_files=str(parquet_path), tokenizer=tokenizer, config=config)
+
+    assert len(dataset) == 1
+    item = dataset[0]
+
+    non_pad_input_ids = item["input_ids"][item["attention_mask"].bool()]
+    decoded_prompt = tokenizer.decode(non_pad_input_ids, skip_special_tokens=False)
+
+    assert item["full_prompts"] == formatted_prompt
+    assert decoded_prompt == formatted_prompt
