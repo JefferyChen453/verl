@@ -4,7 +4,7 @@ DATE=$(date +%Y%m%d%H%M)
 # Ray worker processes can't auto-detect GPU architecture at import time.
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0;9.0}"
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 python -m recipe.watermark_kd_ray.main \
+python -m recipe.watermark_kd_ray.main \
     actor_rollout_ref.model.path=Qwen/Qwen3-14B \
     +actor_rollout_ref.model.override_config.rope_scaling.rope_type=yarn \
     +actor_rollout_ref.model.override_config.rope_scaling.factor=4.0 \
