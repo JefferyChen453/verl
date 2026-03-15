@@ -129,7 +129,7 @@ watermark:
   only_english: true
   ce_loss_weight: 1.0
   green_loss_weight: 1.0
-  kl_biased_ref_actor_weight: 1.0    # KL(D̂_ref ‖ D_actor): biased ref as teacher
+  kl_biased_ref_actor_weight: 0.0    # KL(D̂_ref ‖ D_actor): biased ref as teacher
   kl_ref_actor_weight: 0.0           # KL(D_ref  ‖ D_actor): stability anchor
   kl_biased_actor_actor_weight: 0.0  # KL(D̂_actor ‖ D_actor): actor green-token alignment
   max_grad_norm: 1.0
