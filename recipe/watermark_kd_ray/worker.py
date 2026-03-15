@@ -186,14 +186,15 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
         assert self._is_ref, "update_actor_kd requires ref model (role must include 'ref')"
 
         wm_cfg = self.config.get("watermark", {})
-        strength = float(wm_cfg.get("strength", 2.0))
-        green_loss_weight = float(wm_cfg.get("green_loss_weight", None))
-        kl_loss_weight = float(wm_cfg.get("kl_loss_weight", None))
-        max_grad_norm = float(wm_cfg.get("max_grad_norm", 1.0))
-        need_green_masks = green_loss_weight > 0 or kl_loss_weight > 0
-        need_ref_forward = kl_loss_weight > 0
-
-        assert green_loss_weight is not None or kl_loss_weight is not None, "green_loss_weight and kl_loss_weight cannot be None"
+        strength                     = float(wm_cfg.get("strength", 2.0))
+        ce_loss_weight               = float(wm_cfg.get("ce_loss_weight", 1.0))
+        green_loss_weight            = float(wm_cfg.get("green_loss_weight", 0.0))
+        kl_biased_ref_actor_weight   = float(wm_cfg.get("kl_biased_ref_actor_weight", 0.0))
+        kl_ref_actor_weight          = float(wm_cfg.get("kl_ref_actor_weight", 0.0))
+        kl_biased_actor_actor_weight = float(wm_cfg.get("kl_biased_actor_actor_weight", 0.0))
+        max_grad_norm                = float(wm_cfg.get("max_grad_norm", 1.0))
+        need_green_masks = green_loss_weight > 0 or kl_biased_ref_actor_weight > 0 or kl_biased_actor_actor_weight > 0
+        need_ref_forward = kl_biased_ref_actor_weight > 0 or kl_ref_actor_weight > 0
 
         # Offload management
         if self._is_offload_param:
@@ -320,8 +321,11 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                     sample_index=sample_index_resp,
                     green_masks=green_masks,
                     strength=strength,
+                    ce_loss_weight=ce_loss_weight,
                     green_loss_weight=green_loss_weight,
-                    kl_loss_weight=kl_loss_weight,
+                    kl_biased_ref_actor_weight=kl_biased_ref_actor_weight,
+                    kl_ref_actor_weight=kl_ref_actor_weight,
+                    kl_biased_actor_actor_weight=kl_biased_actor_actor_weight,
                     batch_num_tokens=batch_num_tokens_val,
                     dp_size=self.world_size,
                 )
