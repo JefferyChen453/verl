@@ -84,7 +84,7 @@ class WatermarkZScoreRewardFn:
                 z_score_valid.append(False)
                 continue
 
-            z = self.detector.detect(token_list)
+            z = self.detector.unidetect(token_list)
             z_scores.append(z)
             z_score_valid.append(True)
 

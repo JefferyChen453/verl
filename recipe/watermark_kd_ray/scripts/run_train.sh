@@ -3,7 +3,7 @@ DATE=$(date +%Y%m%d%H%M)
 # Explicitly set CUDA arch so megatron's JIT compile doesn't fail when
 # Ray worker processes can't auto-detect GPU architecture at import time.
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0;9.0}"
-
+sleep 
 python -m recipe.watermark_kd_ray.main \
     actor_rollout_ref.model.path=Qwen/Qwen3-14B \
     +actor_rollout_ref.model.override_config.rope_scaling.rope_type=yarn \
@@ -14,16 +14,20 @@ python -m recipe.watermark_kd_ray.main \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0 \
     data.train_files=/home/tianyichen/llm_watermark/verl/data/sft_modified_loss/vblagoje_lfqa/Qwen-Qwen3-14B_strength_4.0_filtered_pos_3592_neg_0.parquet \
     data.val_files=/home/tianyichen/llm_watermark/verl/data/sft_modified_loss/vblagoje_lfqa/validation_177.parquet \
-    data.train_batch_size=8 \
+    data.train_batch_size=32 \
     data.val_max_samples=64 \
     data.val_batch_size=32 \
+    watermark.ce_loss_weight=1.0 \
     watermark.green_loss_weight=0.2 \
-    watermark.kl_loss_weight=0.0 \
+    watermark.kl_biased_ref_actor_weight=0.0 \
+    watermark.kl_ref_actor_weight=0.0 \
+    watermark.kl_biased_actor_actor_weight=0.0 \
+    watermark.gradient_accumulation_steps=4 \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node=8 \
     trainer.total_epochs=3 \
-    trainer.test_freq=50 \
-    trainer.save_freq=250 \
+    trainer.test_freq=10 \
+    trainer.save_freq=-1 \
     trainer.val_before_train=true \
     trainer.project_name=watermark-kd-ray \
-    trainer.experiment_name=only_sft${DATE}
+    trainer.experiment_name=test_grad_accum_4${DATE}

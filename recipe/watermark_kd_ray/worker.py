@@ -193,6 +193,7 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
         kl_ref_actor_weight          = float(wm_cfg.get("kl_ref_actor_weight", 0.0))
         kl_biased_actor_actor_weight = float(wm_cfg.get("kl_biased_actor_actor_weight", 0.0))
         max_grad_norm                = float(wm_cfg.get("max_grad_norm", 1.0))
+        grad_accum_steps             = int(wm_cfg.get("gradient_accumulation_steps", 1))
         need_green_masks = green_loss_weight > 0 or kl_biased_ref_actor_weight > 0 or kl_biased_actor_actor_weight > 0
         need_ref_forward = kl_biased_ref_actor_weight > 0 or kl_ref_actor_weight > 0
 
@@ -220,6 +221,12 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                 position_ids = (attention_mask.long().cumsum(-1) - 1).clamp(min=0)
 
             N, L_actor = input_ids.shape
+            assert N % grad_accum_steps == 0, (
+                f"Batch size per DP rank ({N}) must be divisible by "
+                f"gradient_accumulation_steps ({grad_accum_steps})"
+            )
+            micro_batch_size = N // grad_accum_steps
+
             if need_green_masks:
                 wm_seeds = batch["wm_seed"].to(device)               # (N,)
                 wm_fractions = batch["wm_fraction"].to(device)       # (N,)
@@ -271,66 +278,102 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                     "Check that both sequences contain identical response content."
                 )
 
-            # --- Forward passes ---
+            # --- Gradient accumulation loop ---
             self.actor_optimizer.zero_grad()
             self.actor_module_fsdp.train()
 
-            with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-                if need_ref_forward:
-                    # Ref forward — clean prompt, frozen, no gradient
-                    with torch.no_grad():
-                        ref_output = self.ref_module_fsdp(
-                            input_ids=input_ids_ref,
-                            attention_mask=attention_mask_ref,
-                            position_ids=position_ids_ref,
-                            use_cache=False,
-                        )
-                        chunk_len_ref = N * (L_ref - 1)
-                        ref_logits = (
-                            ref_output.logits[:, :-1].contiguous().view(chunk_len_ref, -1)[resp_idx_ref]
-                        )
-                        del ref_output
+            accumulated_metrics = []
 
-                # Actor forward — incontext wm prompt, trainable
-                actor_output = self.actor_module_fsdp(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    use_cache=False,
+            for step_i in range(grad_accum_steps):
+                s = step_i * micro_batch_size
+                e = s + micro_batch_size
+
+                # Slice actor tensors for this micro-batch
+                mb_input_ids      = input_ids[s:e]       # (mb_N, L_actor)
+                mb_attention_mask = attention_mask[s:e]
+                mb_loss_mask      = loss_mask[s:e]
+                mb_position_ids   = position_ids[s:e]
+                mb_N              = e - s
+
+                mb_input_ids_rolled_flat = mb_input_ids[:, 1:].contiguous().view(-1)
+                mb_loss_mask_flat        = mb_loss_mask[:, 1:].contiguous().view(-1)
+                mb_sample_index = (
+                    torch.arange(mb_N, device=device)
+                    .unsqueeze(1).expand(-1, L_actor - 1).contiguous().view(-1)
                 )
-                chunk_len_actor = N * (L_actor - 1)
-                actor_logits = (
-                    actor_output.logits[:, :-1].contiguous().view(chunk_len_actor, -1)[resp_idx_actor]
-                )
-                del actor_output
+                mb_resp_idx_actor = mb_loss_mask_flat.bool()
 
-                # Filter actor labels and sample map to response positions
-                input_ids_resp = input_ids_rolled_flat[resp_idx_actor]   # (num_resp,)
-                sample_index_resp = sample_index[resp_idx_actor]         # (num_resp,)
+                mb_green_masks = green_masks[s:e] if need_green_masks else None
 
-                if not need_ref_forward:
-                    ref_logits = actor_logits.new_empty((0, actor_logits.shape[-1]))
-                if not need_green_masks:
-                    green_masks = torch.empty((0, 0), dtype=torch.bool, device=actor_logits.device)
+                with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+                    if need_ref_forward:
+                        mb_input_ids_ref      = input_ids_ref[s:e]
+                        mb_attention_mask_ref = attention_mask_ref[s:e]
+                        mb_position_ids_ref   = position_ids_ref[s:e]
+                        mb_loss_mask_ref_flat = loss_mask_ref[s:e, 1:].contiguous().view(-1)
+                        mb_resp_idx_ref       = mb_loss_mask_ref_flat.bool()
 
-                # --- Compute watermark KD loss ---
-                loss, metrics = compute_watermark_kd_loss(
-                    actor_logits=actor_logits,
-                    ref_logits=ref_logits,
-                    input_ids_rolled=input_ids_resp,
-                    sample_index=sample_index_resp,
-                    green_masks=green_masks,
-                    strength=strength,
-                    ce_loss_weight=ce_loss_weight,
-                    green_loss_weight=green_loss_weight,
-                    kl_biased_ref_actor_weight=kl_biased_ref_actor_weight,
-                    kl_ref_actor_weight=kl_ref_actor_weight,
-                    kl_biased_actor_actor_weight=kl_biased_actor_actor_weight,
-                    batch_num_tokens=batch_num_tokens_val,
-                    dp_size=self.world_size,
-                )
+                        with torch.no_grad():
+                            ref_output = self.ref_module_fsdp(
+                                input_ids=mb_input_ids_ref,
+                                attention_mask=mb_attention_mask_ref,
+                                position_ids=mb_position_ids_ref,
+                                use_cache=False,
+                            )
+                            mb_chunk_len_ref = mb_N * (L_ref - 1)
+                            mb_ref_logits = (
+                                ref_output.logits[:, :-1].contiguous().view(mb_chunk_len_ref, -1)[mb_resp_idx_ref]
+                            )
+                            del ref_output
 
-                loss.backward()
+                    # Actor forward — incontext wm prompt, trainable
+                    actor_output = self.actor_module_fsdp(
+                        input_ids=mb_input_ids,
+                        attention_mask=mb_attention_mask,
+                        position_ids=mb_position_ids,
+                        use_cache=False,
+                    )
+                    mb_chunk_len_actor = mb_N * (L_actor - 1)
+                    mb_actor_logits = (
+                        actor_output.logits[:, :-1].contiguous().view(mb_chunk_len_actor, -1)[mb_resp_idx_actor]
+                    )
+                    del actor_output
+
+                    mb_input_ids_resp    = mb_input_ids_rolled_flat[mb_resp_idx_actor]
+                    mb_sample_index_resp = mb_sample_index[mb_resp_idx_actor]
+
+                    if not need_ref_forward:
+                        mb_ref_logits = mb_actor_logits.new_empty((0, mb_actor_logits.shape[-1]))
+                    if not need_green_masks:
+                        mb_green_masks = torch.empty((0, 0), dtype=torch.bool, device=mb_actor_logits.device)
+
+                    # Normalize by total batch tokens (not micro-batch) so gradients
+                    # accumulate correctly: sum(micro_loss_i) == full_batch_loss
+                    loss, mb_metrics = compute_watermark_kd_loss(
+                        actor_logits=mb_actor_logits,
+                        ref_logits=mb_ref_logits,
+                        input_ids_rolled=mb_input_ids_resp,
+                        sample_index=mb_sample_index_resp,
+                        green_masks=mb_green_masks,
+                        strength=strength,
+                        ce_loss_weight=ce_loss_weight,
+                        green_loss_weight=green_loss_weight,
+                        kl_biased_ref_actor_weight=kl_biased_ref_actor_weight,
+                        kl_ref_actor_weight=kl_ref_actor_weight,
+                        kl_biased_actor_actor_weight=kl_biased_actor_actor_weight,
+                        batch_num_tokens=batch_num_tokens_val,
+                        dp_size=self.world_size,
+                    )
+
+                    loss.backward()
+
+                accumulated_metrics.append(mb_metrics)
+
+            # Aggregate metrics: loss terms are normalized by total tokens, safe to sum.
+            # avg_green_prob is a per-micro-batch average; divide to get overall average.
+            metrics = {k: sum(m[k] for m in accumulated_metrics) for k in accumulated_metrics[0]}
+            if "avg_green_prob" in metrics:
+                metrics["avg_green_prob"] /= grad_accum_steps
 
             # --- Optimizer step ---
             grad_norm = torch.nn.utils.clip_grad_norm_(

@@ -133,10 +133,10 @@ watermark:
   kl_ref_actor_weight: 0.0           # KL(D_ref  ‖ D_actor): stability anchor
   kl_biased_actor_actor_weight: 0.0  # KL(D̂_actor ‖ D_actor): actor green-token alignment
   max_grad_norm: 1.0
+  gradient_accumulation_steps: 1
 
   eval_wm_seed: 1
   eval_wm_fraction: 0.2
-  detection_alpha: 0.05
 
 # ---- Data ----
 data:
