@@ -243,13 +243,15 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
     #  Validation helpers                                                 #
     # ------------------------------------------------------------------ #
 
-    def _maybe_log_val_generations(self, inputs, outputs, scores):
+    def _maybe_log_val_generations(self, inputs, outputs, scores, labels, lengths):
         """Override: log first 10 val samples to a wandb table.
 
         Columns: prefix (first 300 chars of input), completion, z_score.
         The full input_prompt is intentionally omitted as it is too long.
         """
+        import random
         n = min(10, len(inputs))
+        indices = random.sample(range(len(inputs)), n)
         if n == 0:
             return
 
@@ -259,12 +261,14 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
             if wandb.run is None:
                 return
 
-            table = wandb.Table(columns=["prefix", "completion", "z_score"])
-            for i in range(n):
-                prefix = inputs[i][-200:]
+            table = wandb.Table(columns=["prefix", "completion", "z_score", "label", "input_length"])
+            for i in indices:
+                prefix = inputs[i]
                 completion = outputs[i]
                 z_score = scores[i]
-                table.add_data(prefix, completion, z_score)
+                label = labels[i]
+                length = lengths[i]
+                table.add_data(prefix, completion, z_score, label, length)
 
             wandb.log({"val/generations": table}, step=self.global_steps)
         except Exception as e:
@@ -305,8 +309,11 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
         sample_inputs = []
         sample_outputs = []
         sample_gts = []
+        sample_prefixes = []
+        sample_lengths = []
         z_scores = []
         z_score_valid = []
+        sample_labels = []  # "positive" or "negative" per sample
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -325,8 +332,17 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
                 return {}
 
+            # Extract positive_or_negative labels (carried through as non_tensor_batch)
+            batch_labels = test_batch.non_tensor_batch.get("positive_or_negative", None)
+            if batch_labels is not None:
+                sample_labels.extend(str(lbl) for lbl in batch_labels)
+            else:
+                sample_labels.extend(["unknown"] * len(test_batch.batch["input_ids"]))
+
             input_ids = test_batch.batch["input_ids"]
-            sample_inputs.extend(self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids)
+            sample_inputs.extend(self.tokenizer.decode(ids, skip_special_tokens=False) for ids in input_ids)
+            sample_lengths.extend(len(ids) for ids in input_ids)
+            sample_prefixes.extend(test_batch.non_tensor_batch.get("prefix", ["unknown"] * len(test_batch.batch)))
 
             ground_truths = [
                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
@@ -383,7 +399,7 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
             z_scores.extend(float(score) for score in batch_z_scores)
             z_score_valid.extend(bool(flag) for flag in batch_valid)
 
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=z_scores)
+        self._maybe_log_val_generations(inputs=sample_prefixes, outputs=sample_outputs, scores=z_scores, labels=sample_labels, lengths=sample_lengths)
 
         reward_extra_infos_dict = {
             "z_score": z_scores,
@@ -411,11 +427,25 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
         valid_ratio = float(valid_mask.mean())
         metric_dict = {"val/valid_ratio": valid_ratio}
 
+        z_scores_arr = np.asarray(z_scores, dtype=np.float64)
+        labels_arr = np.asarray(sample_labels)
+
         if valid_mask.any():
-            valid_z_scores = np.asarray(z_scores, dtype=np.float64)[valid_mask]
+            valid_z_scores = z_scores_arr[valid_mask]
             metric_dict["val/valid_z_score_mean"] = float(valid_z_scores.mean())
-            metric_dict["val/valid_z_score_min"] = float(valid_z_scores.min())
-            metric_dict["val/valid_z_score_max"] = float(valid_z_scores.max())
+
+        # Per-label (positive / negative) z-score breakdown
+        for label in ("positive", "negative"):
+            label_mask = labels_arr == label
+            label_valid_mask = label_mask & valid_mask
+            label_total = int(label_mask.sum())
+
+            if label_total > 0:
+                metric_dict[f"val/{label}_valid_ratio"] = float(label_valid_mask.sum()) / label_total
+
+            if label_valid_mask.any():
+                label_valid_z = z_scores_arr[label_valid_mask]
+                metric_dict[f"val/{label}_z_score_mean"] = float(label_valid_z.mean())
 
         return metric_dict
 
