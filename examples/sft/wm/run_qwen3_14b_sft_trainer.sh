@@ -27,8 +27,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
     +data.response_key=response \
     data.max_length=81920 \
     data.max_token_len_per_gpu=40960 \
-    data.train_batch_size=32 \
-    data.micro_batch_size_per_gpu=4 \
+    data.train_batch_size=8 \
+    data.micro_batch_size_per_gpu=1 \
     data.truncation=error \
     'data.custom_cls.path=pkg://verl.utils.dataset.sft_dataset' \
     data.custom_cls.name=SFTDataset \
@@ -44,14 +44,14 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
     engine.use_torch_compile=false \
     engine.reshard_after_forward=true \
     engine.forward_prefetch=true \
-    trainer.project_name=watermark-sft \
+    trainer.project_name=watermark-kd-ray \
     trainer.experiment_name=vblagoje_lfqa_sft \
-    trainer.total_epochs=3 \
+    trainer.total_training_steps=200 \
     'trainer.logger=[console,wandb]' \
-    trainer.save_freq=after_each_epoch \
+    trainer.save_freq=-1 \
     trainer.test_freq=500 \
     'checkpoint.save_contents=[model,optimizer,extra]' \
-    optim.lr=1e-5 \
+    optim.lr=7e-6 \
     engine.ulysses_sequence_parallel_size=2 \
     trainer.n_gpus_per_node=8 \
     $@
