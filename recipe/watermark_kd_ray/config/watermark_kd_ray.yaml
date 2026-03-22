@@ -68,7 +68,7 @@ actor_rollout_ref:
     response_length: 600
     prompt_length: 81920
     dtype: bfloat16
-    gpu_memory_utilization: 0.85
+    gpu_memory_utilization: 0.90
     tensor_model_parallel_size: 8
     enforce_eager: false
     enable_chunked_prefill: true

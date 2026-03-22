@@ -447,6 +447,19 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
                 label_valid_z = z_scores_arr[label_valid_mask]
                 metric_dict[f"val/{label}_z_score_mean"] = float(label_valid_z.mean())
 
+        # AUC-ROC: use z_score as discriminator, positive=1 / negative=0
+        pos_mask = labels_arr == "positive"
+        neg_mask = labels_arr == "negative"
+        if pos_mask.any() and neg_mask.any():
+            try:
+                from sklearn.metrics import roc_auc_score
+
+                binary_labels = pos_mask.astype(np.float64)  # 1=positive, 0=negative
+                auc = roc_auc_score(binary_labels, z_scores_arr)
+                metric_dict["val/auc_roc"] = float(auc)
+            except Exception as e:
+                print(f"Warning: could not compute AUC-ROC: {e}")
+
         return metric_dict
 
     # ------------------------------------------------------------------ #
