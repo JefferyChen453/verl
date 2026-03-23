@@ -19,6 +19,8 @@ Notation:
 - KL(D̂_actor ‖ D_actor):  encourage actor to already favour green tokens naturally
 """
 
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 
@@ -37,6 +39,7 @@ def compute_watermark_kd_loss(
     kl_biased_actor_actor_weight: float,
     batch_num_tokens: float,
     dp_size: int,
+    english_vocab_mask: Optional[torch.Tensor] = None,
 ):
     """
     Compute combined watermark KD loss on response-only flattened tensors.
@@ -57,6 +60,9 @@ def compute_watermark_kd_loss(
         kl_biased_actor_actor_weight: weight for KL(D̂_actor ‖ D_actor) (λ_kl3)
         batch_num_tokens:            total response tokens across all dp ranks (for normalization)
         dp_size:                     data parallel world size
+        english_vocab_mask:          (vocab_size,) bool — if provided, KL terms are computed over
+                                     English tokens only (distributions renormalized over English
+                                     sub-vocabulary). CE and L_green always use the full vocab.
 
     Returns:
         (loss, metrics_dict)
@@ -106,6 +112,12 @@ def compute_watermark_kd_loss(
 
             if need_green_bias:
                 green_bias = strength * green_masks[i].float().unsqueeze(0)  # (1, V)
+                if english_vocab_mask is not None:
+                    green_bias_eng = green_bias[:, english_vocab_mask]          # (1, E)
+
+            # English-only actor logits slice (reused across KL terms if english_vocab_mask set)
+            if english_vocab_mask is not None and (need_kl_biased_ref or need_kl_ref or need_kl_biased_actor):
+                actor_logits_eng = actor_logits[token_mask][:, english_vocab_mask]  # (n, E)
 
             # L_green
             if need_green:
@@ -117,24 +129,39 @@ def compute_watermark_kd_loss(
             # KL(D̂_ref ‖ D_actor)
             if need_kl_biased_ref:
                 sample_ref = ref_logits[token_mask]
-                log_p = F.log_softmax(sample_ref + green_bias, dim=-1)
+                if english_vocab_mask is not None:
+                    log_p = F.log_softmax(sample_ref[:, english_vocab_mask] + green_bias_eng, dim=-1)
+                    log_q = F.log_softmax(actor_logits_eng, dim=-1)
+                else:
+                    log_p = F.log_softmax(sample_ref + green_bias, dim=-1)
+                    log_q = sample_log_q
                 p = log_p.exp()
-                kl_per_token = torch.sum(p * (log_p - sample_log_q), dim=-1)
+                kl_per_token = torch.sum(p * (log_p - log_q), dim=-1)
                 l_kl_biased_ref_total = l_kl_biased_ref_total + kl_per_token.sum()
 
             # KL(D_ref ‖ D_actor)
             if need_kl_ref:
                 sample_ref = ref_logits[token_mask] if not need_kl_biased_ref else sample_ref
-                log_p = F.log_softmax(sample_ref, dim=-1)
+                if english_vocab_mask is not None:
+                    log_p = F.log_softmax(sample_ref[:, english_vocab_mask], dim=-1)
+                    log_q = F.log_softmax(actor_logits_eng, dim=-1)
+                else:
+                    log_p = F.log_softmax(sample_ref, dim=-1)
+                    log_q = sample_log_q
                 p = log_p.exp()
-                kl_per_token = torch.sum(p * (log_p - sample_log_q), dim=-1)
+                kl_per_token = torch.sum(p * (log_p - log_q), dim=-1)
                 l_kl_ref_total = l_kl_ref_total + kl_per_token.sum()
 
             # KL(D̂_actor ‖ D_actor)
             if need_kl_biased_actor:
-                log_p = F.log_softmax(actor_logits[token_mask] + green_bias, dim=-1)
+                if english_vocab_mask is not None:
+                    log_p = F.log_softmax(actor_logits_eng + green_bias_eng, dim=-1)
+                    log_q = F.log_softmax(actor_logits_eng, dim=-1)
+                else:
+                    log_p = F.log_softmax(actor_logits[token_mask] + green_bias, dim=-1)
+                    log_q = sample_log_q
                 p = log_p.exp()
-                kl_per_token = torch.sum(p * (log_p - sample_log_q), dim=-1)
+                kl_per_token = torch.sum(p * (log_p - log_q), dim=-1)
                 l_kl_ba_total = l_kl_ba_total + kl_per_token.sum()
 
         # Reduce and accumulate

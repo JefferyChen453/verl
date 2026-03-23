@@ -146,6 +146,23 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
             self._green_mask_cache[key] = mask.bool()
         return self._green_mask_cache[key]
 
+    def _get_english_vocab_mask(self):
+        """Return a (model_emb_length,) bool mask of English token positions, or None if only_english=False."""
+        if not hasattr(self, "_english_vocab_mask_cached"):
+            only_english = self.config.get("watermark", {}).get("only_english", True)
+            if only_english:
+                from gptwm import _get_english_token_ids
+
+                vocab_size = self.tokenizer.vocab_size
+                model_emb_length = self.actor_model_config.vocab_size
+                english_ids = _get_english_token_ids(self.tokenizer, vocab_size)
+                mask = torch.zeros(model_emb_length, dtype=torch.bool)
+                mask[english_ids] = True
+                self._english_vocab_mask_cached = mask
+            else:
+                self._english_vocab_mask_cached = None
+        return self._english_vocab_mask_cached
+
     def _build_sample_green_masks(
         self,
         wm_seeds: torch.Tensor,
@@ -226,6 +243,10 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                 f"gradient_accumulation_steps ({grad_accum_steps})"
             )
             micro_batch_size = N // grad_accum_steps
+
+            english_vocab_mask = self._get_english_vocab_mask()
+            if english_vocab_mask is not None:
+                english_vocab_mask = english_vocab_mask.to(device)
 
             if need_green_masks:
                 wm_seeds = batch["wm_seed"].to(device)               # (N,)
@@ -363,6 +384,7 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                         kl_biased_actor_actor_weight=kl_biased_actor_actor_weight,
                         batch_num_tokens=batch_num_tokens_val,
                         dp_size=self.world_size,
+                        english_vocab_mask=english_vocab_mask,
                     )
 
                     loss.backward()
