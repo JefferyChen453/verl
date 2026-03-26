@@ -24,6 +24,6 @@ CKPT_DIR=/home/tianyichen/llm_watermark/verl/checkpoints
 
 python -m verl.model_merger merge \
     --backend fsdp \
-    --local_dir ${CKPT_DIR}/watermark-sft/LFQA+OpenGen-qwen3-14b/global_step_556 \
-    --target_dir ${CKPT_DIR}/watermark-sft/LFQA+OpenGen-qwen3-14b/global_step_556/hf_model
+    --local_dir ${CKPT_DIR}/watermark-kd-ray/filter_3583_bsz_8__1.0ce_202603231633/global_step_447/actor \
+    --target_dir ${CKPT_DIR}/watermark-kd-ray/filter_3583_bsz_8__1.0ce_202603231633/global_step_447/hf_model
 
