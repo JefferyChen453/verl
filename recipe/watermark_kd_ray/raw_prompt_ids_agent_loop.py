@@ -53,6 +53,12 @@ class RawPromptIdsAgentLoop(AgentLoopBase):
             )
 
         request_sampling_params = dict(sampling_params)
+        # Always cap max_tokens to response_length so that negative validation
+        # samples (short prompts ~500 tokens) don't cause vLLM to generate
+        # ~82,000 tokens instead of 600. Without this, vllm_async_server
+        # computes max_tokens = max_model_len - len(prompt_ids), which is
+        # enormous for short prompts.
+        request_sampling_params["max_tokens"] = self.response_length
         if validate:
             request_sampling_params["_verl_debug_validate"] = True
             request_sampling_params["_verl_debug_uid"] = uid
