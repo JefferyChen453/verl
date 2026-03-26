@@ -16,10 +16,13 @@ Mirrors main_ppo.py but:
 """
 
 import os
+import random
 import socket
 
 import hydra
+import numpy as np
 import ray
+import torch
 from omegaconf import OmegaConf
 
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
@@ -71,6 +74,13 @@ class TaskRunner:
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
+
+        # Set global seeds for reproducibility.
+        seed = config.data.get("seed", 42)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
         # ---- Tokenizer ----
         local_path = copy_to_local(
@@ -165,7 +175,10 @@ def _build_kd_train_dataloader(config, tokenizer):
         max_samples=config.data.get("train_max_samples", -1),
     )
 
-    sampler = RandomSampler(train_dataset)
+    seed = config.data.get("seed", 42)
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    sampler = RandomSampler(train_dataset, generator=generator)
 
     batch_size = config.data.get("train_batch_size", 32)
     num_workers = config.data.get("dataloader_num_workers", 4)

@@ -17,6 +17,7 @@ PPO-specific code removed: no critic, no advantage, no compute_ref_log_prob RPC.
 """
 
 import uuid
+from time import perf_counter
 from typing import Optional
 
 import numpy as np
@@ -314,8 +315,21 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
         z_scores = []
         z_score_valid = []
         sample_labels = []  # "positive" or "negative" per sample
+        prompt_token_lengths = []
+        padded_input_token_lengths = []
+        response_token_lengths = []
+        batch_total_times = []
+        timing_totals = {
+            "val/timing/decode_inputs_s": 0.0,
+            "val/timing/generate_s": 0.0,
+            "val/timing/decode_outputs_s": 0.0,
+            "val/timing/reward_s": 0.0,
+            "val/timing/log_val_generations_s": 0.0,
+        }
+        validate_start = perf_counter()
 
-        for test_data in self.val_dataloader:
+        for batch_idx, test_data in enumerate(self.val_dataloader, start=1):
+            batch_start = perf_counter()
             test_batch = DataProto.from_single_dict(test_data)
 
             # Preserve a stable id for debug logging in the async raw_prompt_ids agent loop.
@@ -340,8 +354,33 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
                 sample_labels.extend(["unknown"] * len(test_batch.batch["input_ids"]))
 
             input_ids = test_batch.batch["input_ids"]
+            attention_mask = test_batch.batch["attention_mask"]
+            batch_prompt_token_lengths = attention_mask.sum(-1).cpu().tolist()
+            batch_padded_input_len = int(input_ids.shape[1])
+            prompt_token_lengths.extend(batch_prompt_token_lengths)
+            padded_input_token_lengths.extend([batch_padded_input_len] * len(batch_prompt_token_lengths))
+
+            batch_label_values = [str(lbl) for lbl in batch_labels] if batch_labels is not None else ["unknown"] * len(
+                batch_prompt_token_lengths
+            )
+            batch_positive = sum(lbl == "positive" for lbl in batch_label_values)
+            batch_negative = sum(lbl == "negative" for lbl in batch_label_values)
+            batch_unknown = len(batch_label_values) - batch_positive - batch_negative
+
+            print(
+                "[validate] batch "
+                f"{batch_idx} size={len(batch_prompt_token_lengths)} "
+                f"labels(pos={batch_positive}, neg={batch_negative}, unknown={batch_unknown}) "
+                f"prompt_tokens(mean={np.mean(batch_prompt_token_lengths):.1f}, "
+                f"max={max(batch_prompt_token_lengths) if batch_prompt_token_lengths else 0}) "
+                f"padded_input_len={batch_padded_input_len}"
+            )
+
+            decode_inputs_start = perf_counter()
             sample_inputs.extend(self.tokenizer.decode(ids, skip_special_tokens=False) for ids in input_ids)
-            sample_lengths.extend(len(ids) for ids in input_ids)
+            batch_decode_inputs_s = perf_counter() - decode_inputs_start
+            timing_totals["val/timing/decode_inputs_s"] += batch_decode_inputs_s
+            sample_lengths.extend(batch_prompt_token_lengths)
             sample_prefixes.extend(test_batch.non_tensor_batch.get("prefix", ["unknown"] * len(test_batch.batch)))
 
             ground_truths = [
@@ -365,14 +404,23 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
                 else self.config.actor_rollout_ref.rollout.agent.num_workers
             )
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+            generate_start = perf_counter()
             if not self.async_rollout_mode:
                 test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
             else:
                 test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+            batch_generate_s = perf_counter() - generate_start
+            timing_totals["val/timing/generate_s"] += batch_generate_s
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
 
             output_ids = test_output_gen_batch.batch["responses"]
+            response_pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+            batch_response_lengths = (output_ids != response_pad_token_id).sum(-1).cpu().tolist()
+            response_token_lengths.extend(batch_response_lengths)
+            decode_outputs_start = perf_counter()
             sample_outputs.extend(self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids)
+            batch_decode_outputs_s = perf_counter() - decode_outputs_start
+            timing_totals["val/timing/decode_outputs_s"] += batch_decode_outputs_s
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
@@ -380,7 +428,10 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
             if self.val_reward_fn is None:
                 raise ValueError("val_reward_fn must be provided for validation.")
 
+            reward_start = perf_counter()
             result = self.val_reward_fn(test_batch, return_dict=True)
+            batch_reward_s = perf_counter() - reward_start
+            timing_totals["val/timing/reward_s"] += batch_reward_s
             reward_extra_info = result.get("reward_extra_info", {})
 
             batch_z_scores = reward_extra_info.get("z_score")
@@ -399,7 +450,23 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
             z_scores.extend(float(score) for score in batch_z_scores)
             z_score_valid.extend(bool(flag) for flag in batch_valid)
 
+            batch_total = perf_counter() - batch_start
+            batch_total_times.append(batch_total)
+            print(
+                "[validate] batch "
+                f"{batch_idx} timings "
+                f"decode_inputs={batch_decode_inputs_s:.2f}s "
+                f"generate={batch_generate_s:.2f}s "
+                f"decode_outputs={batch_decode_outputs_s:.2f}s "
+                f"reward={batch_reward_s:.2f}s "
+                f"batch_total={batch_total:.2f}s "
+                f"response_tokens(mean={np.mean(batch_response_lengths):.1f}, "
+                f"max={max(batch_response_lengths) if batch_response_lengths else 0})"
+            )
+
+        log_val_generations_start = perf_counter()
         self._maybe_log_val_generations(inputs=sample_prefixes, outputs=sample_outputs, scores=z_scores, labels=sample_labels, lengths=sample_lengths)
+        timing_totals["val/timing/log_val_generations_s"] += perf_counter() - log_val_generations_start
 
         reward_extra_infos_dict = {
             "z_score": z_scores,
@@ -426,6 +493,19 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
 
         valid_ratio = float(valid_mask.mean())
         metric_dict = {"val/valid_ratio": valid_ratio}
+        metric_dict["val/timing/total_s"] = perf_counter() - validate_start
+        metric_dict.update(timing_totals)
+        metric_dict["val/prompt_tokens_mean"] = float(np.mean(prompt_token_lengths)) if prompt_token_lengths else 0.0
+        metric_dict["val/prompt_tokens_max"] = float(np.max(prompt_token_lengths)) if prompt_token_lengths else 0.0
+        metric_dict["val/padded_input_tokens_mean"] = (
+            float(np.mean(padded_input_token_lengths)) if padded_input_token_lengths else 0.0
+        )
+        metric_dict["val/padded_input_tokens_max"] = (
+            float(np.max(padded_input_token_lengths)) if padded_input_token_lengths else 0.0
+        )
+        metric_dict["val/response_tokens_mean"] = float(np.mean(response_token_lengths)) if response_token_lengths else 0.0
+        metric_dict["val/response_tokens_max"] = float(np.max(response_token_lengths)) if response_token_lengths else 0.0
+        metric_dict["val/timing/max_batch_total_s"] = float(np.max(batch_total_times)) if batch_total_times else 0.0
 
         z_scores_arr = np.asarray(z_scores, dtype=np.float64)
         labels_arr = np.asarray(sample_labels)
@@ -446,6 +526,10 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
             if label_valid_mask.any():
                 label_valid_z = z_scores_arr[label_valid_mask]
                 metric_dict[f"val/{label}_z_score_mean"] = float(label_valid_z.mean())
+
+            if label_total > 0:
+                label_prompt_lens = np.asarray(prompt_token_lengths)[label_mask]
+                metric_dict[f"val/{label}_prompt_tokens_mean"] = float(label_prompt_lens.mean())
 
         # AUC-ROC: use z_score as discriminator, positive=1 / negative=0
         pos_mask = labels_arr == "positive"
@@ -489,6 +573,12 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
         test_freq = self.config.trainer.get("test_freq", -1)
         save_freq = self.config.trainer.get("save_freq", -1)
         val_before_train = self.config.trainer.get("val_before_train", False)
+
+        steps_per_epoch = len(self.train_dataloader)
+        if save_freq == "after_each_epoch":
+            save_freq = steps_per_epoch
+        if test_freq == "after_each_epoch":
+            test_freq = steps_per_epoch
 
         # Optional validation before training begins
         if val_before_train and self.val_dataloader is not None:
