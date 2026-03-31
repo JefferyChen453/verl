@@ -276,6 +276,21 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
             print(f"Warning: failed to log wandb val table: {e}")
 
     @staticmethod
+    def _ngram_rep_ratio(text: str, n: int = 4) -> float:
+        """Compute n-gram repetition ratio for a single decoded response.
+
+        Returns the fraction of n-grams that are repeated:
+            1 - unique_ngrams / total_ngrams
+        A higher value means more repetition. Returns 0.0 if the text is too
+        short to form any n-gram.
+        """
+        tokens = text.split()
+        if len(tokens) < n:
+            return 0.0
+        ngrams = [tuple(tokens[i : i + n]) for i in range(len(tokens) - n + 1)]
+        return 1.0 - len(set(ngrams)) / len(ngrams)
+
+    @staticmethod
     def _reduce_worker_metrics(metrics: dict) -> dict:
         """Collapse per-worker metric lists into scalar values for logging."""
         if not metrics:
@@ -543,6 +558,14 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
                 metric_dict["val/auc_roc"] = float(auc)
             except Exception as e:
                 print(f"Warning: could not compute AUC-ROC: {e}")
+
+        # N-gram repetition ratio (positive samples only)
+        outputs_arr = np.asarray(sample_outputs, dtype=object)
+        if pos_mask.any():
+            pos_rep_ratios = [
+                self._ngram_rep_ratio(text) for text in outputs_arr[pos_mask]
+            ]
+            metric_dict["val/positive_ngram_rep_ratio"] = float(np.mean(pos_rep_ratios))
 
         return metric_dict
 
