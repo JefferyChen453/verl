@@ -211,6 +211,7 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
         kl_biased_actor_actor_weight = float(wm_cfg.get("kl_biased_actor_actor_weight", 0.0))
         max_grad_norm                = float(wm_cfg.get("max_grad_norm", 1.0))
         grad_accum_steps             = int(wm_cfg.get("gradient_accumulation_steps", 1))
+        green_target_ratio           = float(wm_cfg.get("green_target_ratio", 0.0))
         need_green_masks = green_loss_weight > 0 or kl_biased_ref_actor_weight > 0 or kl_biased_actor_actor_weight > 0
         need_ref_forward = kl_biased_ref_actor_weight > 0 or kl_ref_actor_weight > 0
 
@@ -325,6 +326,7 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                 mb_resp_idx_actor = mb_loss_mask_flat.bool()
 
                 mb_green_masks = green_masks[s:e] if need_green_masks else None
+                mb_fractions = wm_fractions[s:e] if need_green_masks else None
 
                 with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
                     if need_ref_forward:
@@ -385,6 +387,8 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                         batch_num_tokens=batch_num_tokens_val,
                         dp_size=self.world_size,
                         english_vocab_mask=english_vocab_mask,
+                        green_target_ratio=green_target_ratio,
+                        sample_fractions=mb_fractions,
                     )
 
                     loss.backward()

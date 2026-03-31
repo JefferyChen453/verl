@@ -40,6 +40,8 @@ def compute_watermark_kd_loss(
     batch_num_tokens: float,
     dp_size: int,
     english_vocab_mask: Optional[torch.Tensor] = None,
+    green_target_ratio: float = 0.0,
+    sample_fractions: Optional[torch.Tensor] = None,
 ):
     """
     Compute combined watermark KD loss on response-only flattened tensors.
@@ -93,6 +95,13 @@ def compute_watermark_kd_loss(
             actor_probs = log_probs_all.exp()
             l_green_total = torch.zeros(1, device=actor_logits.device, dtype=actor_logits.dtype)
             green_prob_sum = torch.zeros(1, device=actor_logits.device, dtype=actor_logits.dtype)
+            use_green_hinge = green_target_ratio > 0.0 and sample_fractions is not None
+            if use_green_hinge:
+                # Per-sample hinge thresholds: target_i = fraction_i * ratio
+                # Loss = max(0, -log(green_prob) - (-log(target_i))) = max(0, log(target_i/green_prob))
+                # Gradient is zero when green_prob >= target_i, unchanged otherwise.
+                green_targets = (sample_fractions.float() * green_target_ratio).clamp(max=1.0 - 1e-8)
+                green_target_losses = -torch.log(green_targets)  # (num_samples,)
         if need_kl_biased_ref:
             l_kl_biased_ref_total = torch.zeros(1, device=actor_logits.device, dtype=actor_logits.dtype)
         if need_kl_ref:
@@ -123,7 +132,10 @@ def compute_watermark_kd_loss(
             if need_green:
                 sample_probs = actor_probs[token_mask]
                 green_prob = sample_probs[:, green_masks[i]].sum(dim=-1).clamp(min=1e-8)
-                l_green_total = l_green_total + (-torch.log(green_prob)).sum()
+                per_token_loss = -torch.log(green_prob)
+                if use_green_hinge:
+                    per_token_loss = torch.clamp(per_token_loss - green_target_losses[i], min=0.0)
+                l_green_total = l_green_total + per_token_loss.sum()
                 green_prob_sum = green_prob_sum + green_prob.sum()
 
             # KL(D̂_ref ‖ D_actor)
