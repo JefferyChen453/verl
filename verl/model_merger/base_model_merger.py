@@ -57,6 +57,13 @@ def parse_args():
         help="Whether to use CPU initialization for the model. This is useful for large models that cannot "
         "fit into GPU memory during initialization.",
     )
+    base_op_parser.add_argument(
+        "--hf_model_path",
+        type=str,
+        default=None,
+        help="HuggingFace model name or path to load config/tokenizer from (e.g. 'Qwen/Qwen3-14B'). "
+        "If provided, uses ~/.cache/huggingface hub cache instead of <local_dir>/huggingface/.",
+    )
 
     merge_parser = subparsers.add_parser("merge", parents=[base_op_parser], help="Merge model checkpoints and save.")
     merge_parser.add_argument(
@@ -132,7 +139,7 @@ def generate_config_from_args(args: argparse.Namespace) -> ModelMergerConfig:
         "trust_remote_code": args.trust_remote_code,
         "is_value_model": args.is_value_model,
         "local_dir": args.local_dir,
-        "hf_model_config_path": os.path.join(args.local_dir, "huggingface"),
+        "hf_model_config_path": args.hf_model_path if args.hf_model_path else os.path.join(args.local_dir, "huggingface"),
         "use_cpu_initialization": args.use_cpu_initialization,
     }
 
