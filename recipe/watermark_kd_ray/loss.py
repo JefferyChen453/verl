@@ -1,8 +1,9 @@
 """
 Watermark KD loss: ce_loss_weight * L_CE + green_loss_weight * L_green
-                 + kl_biased_ref_actor_weight  * KL(D̂_ref  ‖ D_actor)
-                 + kl_ref_actor_weight         * KL(D_ref   ‖ D_actor)
-                 + kl_biased_actor_actor_weight * KL(D̂_actor ‖ D_actor)
+                 + kl_biased_ref_actor_weight         * KL(D̂_ref  ‖ D_actor)
+                 + reverse_kl_biased_ref_actor_weight * KL(D_actor ‖ D̂_ref)
+                 + kl_ref_actor_weight                * KL(D_ref   ‖ D_actor)
+                 + kl_biased_actor_actor_weight        * KL(D̂_actor ‖ D_actor)
 
 Notation:
   D_ref        = softmax(ref_logits)                          — unbiased reference
@@ -14,7 +15,8 @@ Notation:
 - L_green: encourages actor to place probability mass on green tokens
            = -log(sum(actor_probs[green_mask])) averaged over response tokens
            Each sample uses its own green mask (from per-sample seed/fraction).
-- KL(D̂_ref ‖ D_actor):   align actor with watermarked teacher (original KL term)
+- KL(D̂_ref ‖ D_actor):   align actor with watermarked teacher (mean-seeking)
+- KL(D_actor ‖ D̂_ref):   reverse KL — actor avoids mass where biased ref is low (mode-seeking)
 - KL(D_ref  ‖ D_actor):   standard KD stability anchor (no watermark)
 - KL(D̂_actor ‖ D_actor):  encourage actor to already favour green tokens naturally
 """
@@ -35,6 +37,7 @@ def compute_watermark_kd_loss(
     ce_loss_weight: float,
     green_loss_weight: float,
     kl_biased_ref_actor_weight: float,
+    reverse_kl_biased_ref_actor_weight: float,
     kl_ref_actor_weight: float,
     kl_biased_actor_actor_weight: float,
     batch_num_tokens: float,
@@ -57,8 +60,9 @@ def compute_watermark_kd_loss(
         strength:                    scalar bias added to logits on green positions
         ce_loss_weight:              weight for L_CE (λ_ce)
         green_loss_weight:           weight for L_green (λ_green)
-        kl_biased_ref_actor_weight:  weight for KL(D̂_ref ‖ D_actor) (λ_kl1)
-        kl_ref_actor_weight:         weight for KL(D_ref  ‖ D_actor) (λ_kl2)
+        kl_biased_ref_actor_weight:          weight for KL(D̂_ref ‖ D_actor) (λ_kl1)
+        reverse_kl_biased_ref_actor_weight:  weight for KL(D_actor ‖ D̂_ref) (λ_kl1r)
+        kl_ref_actor_weight:                 weight for KL(D_ref  ‖ D_actor) (λ_kl2)
         kl_biased_actor_actor_weight: weight for KL(D̂_actor ‖ D_actor) (λ_kl3)
         batch_num_tokens:            total response tokens across all dp ranks (for normalization)
         dp_size:                     data parallel world size
@@ -86,9 +90,10 @@ def compute_watermark_kd_loss(
     # ---- Per-sample losses: single loop ----
     need_green = green_loss_weight > 0
     need_kl_biased_ref = kl_biased_ref_actor_weight > 0
+    need_reverse_kl_biased_ref = reverse_kl_biased_ref_actor_weight > 0
     need_kl_ref = kl_ref_actor_weight > 0
     need_kl_biased_actor = kl_biased_actor_actor_weight > 0
-    need_loop = need_green or need_kl_biased_ref or need_kl_ref or need_kl_biased_actor
+    need_loop = need_green or need_kl_biased_ref or need_reverse_kl_biased_ref or need_kl_ref or need_kl_biased_actor
 
     if need_loop:
         if need_green:
@@ -104,12 +109,14 @@ def compute_watermark_kd_loss(
                 green_target_losses = -torch.log(green_targets)  # (num_samples,)
         if need_kl_biased_ref:
             l_kl_biased_ref_total = torch.zeros(1, device=actor_logits.device, dtype=actor_logits.dtype)
+        if need_reverse_kl_biased_ref:
+            l_kl_biased_ref_rev_total = torch.zeros(1, device=actor_logits.device, dtype=actor_logits.dtype)
         if need_kl_ref:
             l_kl_ref_total = torch.zeros(1, device=actor_logits.device, dtype=actor_logits.dtype)
         if need_kl_biased_actor:
             l_kl_ba_total = torch.zeros(1, device=actor_logits.device, dtype=actor_logits.dtype)
 
-        need_green_bias = need_kl_biased_ref or need_kl_biased_actor
+        need_green_bias = need_kl_biased_ref or need_reverse_kl_biased_ref or need_kl_biased_actor
 
         for i in range(num_samples):
             token_mask = sample_index == i
@@ -125,7 +132,7 @@ def compute_watermark_kd_loss(
                     green_bias_eng = green_bias[:, english_vocab_mask]          # (1, E)
 
             # English-only actor logits slice (reused across KL terms if english_vocab_mask set)
-            if english_vocab_mask is not None and (need_kl_biased_ref or need_kl_ref or need_kl_biased_actor):
+            if english_vocab_mask is not None and (need_kl_biased_ref or need_reverse_kl_biased_ref or need_kl_ref or need_kl_biased_actor):
                 actor_logits_eng = actor_logits[token_mask][:, english_vocab_mask]  # (n, E)
 
             # L_green
@@ -150,6 +157,19 @@ def compute_watermark_kd_loss(
                 p = log_p.exp()
                 kl_per_token = torch.sum(p * (log_p - log_q), dim=-1)
                 l_kl_biased_ref_total = l_kl_biased_ref_total + kl_per_token.sum()
+
+            # KL(D_actor ‖ D̂_ref)  — reverse biased ref
+            if need_reverse_kl_biased_ref:
+                sample_ref = ref_logits[token_mask] if not need_kl_biased_ref else sample_ref
+                if english_vocab_mask is not None:
+                    log_p = F.log_softmax(actor_logits_eng, dim=-1)
+                    log_q = F.log_softmax(sample_ref[:, english_vocab_mask] + green_bias_eng, dim=-1)
+                else:
+                    log_p = sample_log_q
+                    log_q = F.log_softmax(sample_ref + green_bias, dim=-1)
+                p = log_p.exp()
+                kl_per_token = torch.sum(p * (log_p - log_q), dim=-1)
+                l_kl_biased_ref_rev_total = l_kl_biased_ref_rev_total + kl_per_token.sum()
 
             # KL(D_ref ‖ D_actor)
             if need_kl_ref:
@@ -190,6 +210,11 @@ def compute_watermark_kd_loss(
             l_kl_biased_ref_actor = l_kl_biased_ref_total / batch_num_tokens * dp_size
             loss = loss + kl_biased_ref_actor_weight * l_kl_biased_ref_actor
             metrics["kl_biased_ref_actor"] = l_kl_biased_ref_actor.detach().item()
+
+        if need_reverse_kl_biased_ref:
+            l_kl_biased_ref_actor_reverse = l_kl_biased_ref_rev_total / batch_num_tokens * dp_size
+            loss = loss + reverse_kl_biased_ref_actor_weight * l_kl_biased_ref_actor_reverse
+            metrics["kl_biased_ref_actor_reverse"] = l_kl_biased_ref_actor_reverse.detach().item()
 
         if need_kl_ref:
             l_kl_ref_actor = l_kl_ref_total / batch_num_tokens * dp_size

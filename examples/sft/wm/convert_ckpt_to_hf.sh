@@ -27,11 +27,11 @@ HF_MODEL_PATH=Qwen/Qwen3-14B
 python -m verl.model_merger merge \
     --backend fsdp \
     --hf_model_path ${HF_MODEL_PATH} \
-    --local_dir ${CKPT_DIR}/watermark-kd-ray/filter_strength_5.0_5931_bsz_8__0.0green+1.0kl_biased_ref_202603300527/global_step_741/actor \
-    --target_dir ${CKPT_DIR}/watermark-kd-ray/filter_strength_5.0_5931_bsz_8__0.0green+1.0kl_biased_ref_202603300527/global_step_741/hf_model
+    --local_dir ${CKPT_DIR}/watermark-kd-ray/filter_strength_5.0_5931_bsz_8__0.0green+1.0reverse_kl_biased_ref_202604032354/global_step_741/actor \
+    --target_dir ${CKPT_DIR}/watermark-kd-ray/filter_strength_5.0_5931_bsz_8__0.0green+1.0reverse_kl_biased_ref_202604032354/global_step_741/hf_model
 
 python -m verl.model_merger merge \
     --backend fsdp \
     --hf_model_path ${HF_MODEL_PATH} \
-    --local_dir ${CKPT_DIR}/watermark-kd-ray/filter_strength_5.0_5931_bsz_8__0.0green+1.0kl_biased_ref_202603300527/global_step_1482/actor \
-    --target_dir ${CKPT_DIR}/watermark-kd-ray/filter_strength_5.0_5931_bsz_8__0.0green+1.0kl_biased_ref_202603300527/global_step_1482/hf_model
+    --local_dir ${CKPT_DIR}/watermark-kd-ray/filter_strength_5.0_5931_bsz_8__0.0green+1.0reverse_kl_biased_ref_202604032354/global_step_1482/actor \
+    --target_dir ${CKPT_DIR}/watermark-kd-ray/filter_strength_5.0_5931_bsz_8__0.0green+1.0reverse_kl_biased_ref_202604032354/global_step_1482/hf_model

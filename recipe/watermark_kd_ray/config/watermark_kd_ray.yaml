@@ -129,8 +129,9 @@ watermark:
   only_english: true
   ce_loss_weight: 1.0
   green_loss_weight: 1.0
-  kl_biased_ref_actor_weight: 0.0    # KL(D̂_ref ‖ D_actor): biased ref as teacher
-  kl_ref_actor_weight: 0.0           # KL(D_ref  ‖ D_actor): stability anchor
+  kl_biased_ref_actor_weight: 0.0         # KL(D̂_ref ‖ D_actor): biased ref as teacher (mean-seeking)
+  reverse_kl_biased_ref_actor_weight: 0.0 # KL(D_actor ‖ D̂_ref): reverse biased ref (mode-seeking)
+  kl_ref_actor_weight: 0.0                # KL(D_ref  ‖ D_actor): stability anchor
   kl_biased_actor_actor_weight: 0.0  # KL(D̂_actor ‖ D_actor): actor green-token alignment
   green_target_ratio: 0.0            # fraction-relative hinge; 0.0 = disabled. E.g. 2.0 means target = 2 * fraction_i per sample
   max_grad_norm: 1.0

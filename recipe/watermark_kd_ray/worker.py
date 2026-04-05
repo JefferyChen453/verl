@@ -206,14 +206,15 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
         strength                     = float(wm_cfg.get("strength", 2.0))
         ce_loss_weight               = float(wm_cfg.get("ce_loss_weight", 1.0))
         green_loss_weight            = float(wm_cfg.get("green_loss_weight", 0.0))
-        kl_biased_ref_actor_weight   = float(wm_cfg.get("kl_biased_ref_actor_weight", 0.0))
-        kl_ref_actor_weight          = float(wm_cfg.get("kl_ref_actor_weight", 0.0))
+        kl_biased_ref_actor_weight         = float(wm_cfg.get("kl_biased_ref_actor_weight", 0.0))
+        reverse_kl_biased_ref_actor_weight = float(wm_cfg.get("reverse_kl_biased_ref_actor_weight", 0.0))
+        kl_ref_actor_weight                = float(wm_cfg.get("kl_ref_actor_weight", 0.0))
         kl_biased_actor_actor_weight = float(wm_cfg.get("kl_biased_actor_actor_weight", 0.0))
         max_grad_norm                = float(wm_cfg.get("max_grad_norm", 1.0))
         grad_accum_steps             = int(wm_cfg.get("gradient_accumulation_steps", 1))
         green_target_ratio           = float(wm_cfg.get("green_target_ratio", 0.0))
-        need_green_masks = green_loss_weight > 0 or kl_biased_ref_actor_weight > 0 or kl_biased_actor_actor_weight > 0
-        need_ref_forward = kl_biased_ref_actor_weight > 0 or kl_ref_actor_weight > 0
+        need_green_masks = green_loss_weight > 0 or kl_biased_ref_actor_weight > 0 or reverse_kl_biased_ref_actor_weight > 0 or kl_biased_actor_actor_weight > 0
+        need_ref_forward = kl_biased_ref_actor_weight > 0 or reverse_kl_biased_ref_actor_weight > 0 or kl_ref_actor_weight > 0
 
         # Offload management
         if self._is_offload_param:
@@ -382,6 +383,7 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                         ce_loss_weight=ce_loss_weight,
                         green_loss_weight=green_loss_weight,
                         kl_biased_ref_actor_weight=kl_biased_ref_actor_weight,
+                        reverse_kl_biased_ref_actor_weight=reverse_kl_biased_ref_actor_weight,
                         kl_ref_actor_weight=kl_ref_actor_weight,
                         kl_biased_actor_actor_weight=kl_biased_actor_actor_weight,
                         batch_num_tokens=batch_num_tokens_val,
