@@ -205,6 +205,13 @@ class WatermarkOnPolicyTrainer(WatermarkKDRayTrainer):
 
                 # --- Rollout ---
                 gen_batch = self._get_gen_batch(batch)
+                # _get_gen_batch pops non_tensor fields (wm_seed, wm_fraction,
+                # raw_prompt_ids_ref, …) from batch into gen_batch.
+                # generate_sequences() / agent loop won't preserve them in gen_out,
+                # so copy them back to batch so they survive through batch_rep.union(gen_out).
+                for key in ("wm_seed", "wm_fraction", "raw_prompt_ids_ref"):
+                    if key in gen_batch.non_tensor_batch and key not in batch.non_tensor_batch:
+                        batch.non_tensor_batch[key] = gen_batch.non_tensor_batch[key].copy()
                 gen_batch.meta_info = {
                     "eos_token_id": self.tokenizer.eos_token_id,
                     "pad_token_id": self.tokenizer.pad_token_id,
@@ -233,10 +240,10 @@ class WatermarkOnPolicyTrainer(WatermarkKDRayTrainer):
 
                 # Quick assertion to catch field routing issues early (first step only)
                 if self.global_steps == 1:
-                    assert "wm_seed" in full_batch.non_tensor_batch, (
-                        "wm_seed missing from full_batch.non_tensor_batch — "
-                        "check that WatermarkPromptCollator emits it as np.ndarray"
-                    )
+                    for key in ("wm_seed", "wm_fraction", "raw_prompt_ids_ref"):
+                        assert key in full_batch.non_tensor_batch, (
+                            f"{key} missing from full_batch.non_tensor_batch"
+                        )
                     assert "responses" in full_batch.batch.keys(), (
                         "responses missing from full_batch.batch — "
                         "check that generate_sequences populates it"
