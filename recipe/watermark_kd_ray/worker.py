@@ -108,9 +108,27 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
 
         super()._build_rollout(trust_remote_code=trust_remote_code)
 
+    def _need_ref_model(self) -> bool:
+        """Check if any ref-dependent loss term is enabled in watermark config."""
+        wm_cfg = self.config.get("watermark", {})
+        return (
+            float(wm_cfg.get("kl_biased_ref_actor_weight", 0.0)) > 0
+            or float(wm_cfg.get("reverse_kl_biased_ref_actor_weight", 0.0)) > 0
+            or float(wm_cfg.get("kl_ref_actor_weight", 0.0)) > 0
+            or float(wm_cfg.get("reverse_kl_ref_actor_weight", 0.0)) > 0
+        )
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
-        """Call parent init_model(), then freeze and set ref model to eval mode."""
+        """Call parent init_model(), then freeze and set ref model to eval mode.
+
+        If no ref-dependent loss terms are enabled, skip ref model loading
+        entirely by setting _is_ref=False before parent init.
+        """
+        if not self._need_ref_model():
+            logger.info("No ref-dependent loss terms enabled — skipping ref model loading")
+            self._is_ref = False
+
         super().init_model()
         if self._is_ref and hasattr(self, "ref_module_fsdp"):
             self.ref_module_fsdp.eval()
@@ -200,7 +218,6 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
             total_loss, ce_loss, green_loss, kl_loss, avg_green_prob, grad_norm, lr
         """
         assert self._is_actor, "update_actor_kd requires actor role"
-        assert self._is_ref, "update_actor_kd requires ref model (role must include 'ref')"
 
         wm_cfg = self.config.get("watermark", {})
         strength                     = float(wm_cfg.get("strength", 2.0))
@@ -209,12 +226,19 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
         kl_biased_ref_actor_weight         = float(wm_cfg.get("kl_biased_ref_actor_weight", 0.0))
         reverse_kl_biased_ref_actor_weight = float(wm_cfg.get("reverse_kl_biased_ref_actor_weight", 0.0))
         kl_ref_actor_weight                = float(wm_cfg.get("kl_ref_actor_weight", 0.0))
+        reverse_kl_ref_actor_weight        = float(wm_cfg.get("reverse_kl_ref_actor_weight", 0.0))
         kl_biased_actor_actor_weight = float(wm_cfg.get("kl_biased_actor_actor_weight", 0.0))
+        reverse_kl_biased_actor_actor_weight = float(wm_cfg.get("reverse_kl_biased_actor_actor_weight", 0.0))
         max_grad_norm                = float(wm_cfg.get("max_grad_norm", 1.0))
         grad_accum_steps             = int(wm_cfg.get("gradient_accumulation_steps", 1))
         green_target_ratio           = float(wm_cfg.get("green_target_ratio", 0.0))
-        need_green_masks = green_loss_weight > 0 or kl_biased_ref_actor_weight > 0 or reverse_kl_biased_ref_actor_weight > 0 or kl_biased_actor_actor_weight > 0
-        need_ref_forward = kl_biased_ref_actor_weight > 0 or reverse_kl_biased_ref_actor_weight > 0 or kl_ref_actor_weight > 0
+        need_green_masks = green_loss_weight > 0 or kl_biased_ref_actor_weight > 0 or reverse_kl_biased_ref_actor_weight > 0 or kl_biased_actor_actor_weight > 0 or reverse_kl_biased_actor_actor_weight > 0
+        need_ref_forward = kl_biased_ref_actor_weight > 0 or reverse_kl_biased_ref_actor_weight > 0 or kl_ref_actor_weight > 0 or reverse_kl_ref_actor_weight > 0
+        if need_ref_forward:
+            assert self._is_ref, (
+                "Ref-dependent loss terms are enabled but ref model was not loaded. "
+                "Check watermark config — _need_ref_model() must return True for ref terms."
+            )
 
         # Offload management
         if self._is_offload_param:
@@ -385,7 +409,9 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                         kl_biased_ref_actor_weight=kl_biased_ref_actor_weight,
                         reverse_kl_biased_ref_actor_weight=reverse_kl_biased_ref_actor_weight,
                         kl_ref_actor_weight=kl_ref_actor_weight,
+                        reverse_kl_ref_actor_weight=reverse_kl_ref_actor_weight,
                         kl_biased_actor_actor_weight=kl_biased_actor_actor_weight,
+                        reverse_kl_biased_actor_actor_weight=reverse_kl_biased_actor_actor_weight,
                         batch_num_tokens=batch_num_tokens_val,
                         dp_size=self.world_size,
                         english_vocab_mask=english_vocab_mask,

@@ -5,9 +5,11 @@ Extends WatermarkActorRolloutRefWorker (from watermark_kd_ray) with a single
 new RPC: update_actor_onpolicy().
 
 On-policy design:
-  - Batch arrives from trainer after vLLM rollout: full (prompt + response) sequences
+  - Actor sees: [in-context wm prompt | rollout response]   (same as offline KD)
+  - Ref sees:   [clean prompt (no green list) | same response]  (same as offline KD)
   - loss_mask is derived on-the-fly from attention_mask + response length
-  - Actor and ref forward on the SAME input_ids (no separate clean-prompt ref path)
+  - Ref sequences are constructed dynamically in the worker from raw_prompt_ids_ref
+    (clean prompt token ids) + response tokens extracted from actor's input_ids
   - wm_seed / wm_fraction come from non_tensor_batch (not batch tensors)
 
 The KD loss function (compute_watermark_kd_loss) is unchanged.
@@ -68,21 +70,24 @@ class WatermarkOnPolicyWorker(WatermarkActorRolloutRefWorker):
         """
         On-policy KD update step.
 
-        Expected data.batch keys (all padded tensors from rollout output):
-            input_ids       (N, L)   long   — full sequence: left-pad + prompt + response + right-pad
+        Expected data.batch keys (padded tensors from rollout output):
+            input_ids       (N, L)   long   — actor full sequence: left-pad + wm_prompt + response + right-pad
             attention_mask  (N, L)   long   — 1 for real tokens
             position_ids    (N, L)   long
             responses       (N, R)   long   — response-only tokens (R = response_length)
 
         Expected data.non_tensor_batch keys:
-            wm_seed         (N,)     object array of ints
-            wm_fraction     (N,)     object array of floats
+            wm_seed             (N,)  object array of ints
+            wm_fraction         (N,)  object array of floats
+            raw_prompt_ids_ref  (N,)  object array of list[int] — clean prompt token ids for ref
+
+        Ref sequences are constructed dynamically as [clean_prompt | same_response],
+        left-padded to max ref length across the batch.  L_ref ≠ L (clean prompt is shorter).
 
         Returns DataProto with meta_info["metrics"] containing:
             total_loss, kl_biased_ref_actor (and other active terms), avg_green_prob, grad_norm, lr
         """
         assert self._is_actor, "update_actor_onpolicy requires actor role"
-        assert self._is_ref, "update_actor_onpolicy requires ref model (role must include 'ref')"
 
         wm_cfg = self.config.get("watermark", {})
         strength                          = float(wm_cfg.get("strength", 2.0))
@@ -91,7 +96,9 @@ class WatermarkOnPolicyWorker(WatermarkActorRolloutRefWorker):
         kl_biased_ref_actor_weight        = float(wm_cfg.get("kl_biased_ref_actor_weight", 1.0))
         reverse_kl_biased_ref_actor_weight = float(wm_cfg.get("reverse_kl_biased_ref_actor_weight", 0.0))
         kl_ref_actor_weight               = float(wm_cfg.get("kl_ref_actor_weight", 0.0))
+        reverse_kl_ref_actor_weight       = float(wm_cfg.get("reverse_kl_ref_actor_weight", 0.0))
         kl_biased_actor_actor_weight      = float(wm_cfg.get("kl_biased_actor_actor_weight", 0.0))
+        reverse_kl_biased_actor_actor_weight = float(wm_cfg.get("reverse_kl_biased_actor_actor_weight", 0.0))
         max_grad_norm                     = float(wm_cfg.get("max_grad_norm", 1.0))
         grad_accum_steps                  = int(wm_cfg.get("gradient_accumulation_steps", 1))
         green_target_ratio                = float(wm_cfg.get("green_target_ratio", 0.0))
@@ -101,12 +108,19 @@ class WatermarkOnPolicyWorker(WatermarkActorRolloutRefWorker):
             or kl_biased_ref_actor_weight > 0
             or reverse_kl_biased_ref_actor_weight > 0
             or kl_biased_actor_actor_weight > 0
+            or reverse_kl_biased_actor_actor_weight > 0
         )
         need_ref_forward = (
             kl_biased_ref_actor_weight > 0
             or reverse_kl_biased_ref_actor_weight > 0
             or kl_ref_actor_weight > 0
+            or reverse_kl_ref_actor_weight > 0
         )
+        if need_ref_forward:
+            assert self._is_ref, (
+                "Ref-dependent loss terms are enabled but ref model was not loaded. "
+                "Check watermark config — _need_ref_model() must return True for ref terms."
+            )
 
         # Offload management
         if self._is_offload_param:
@@ -129,6 +143,17 @@ class WatermarkOnPolicyWorker(WatermarkActorRolloutRefWorker):
                 position_ids = batch["position_ids"].to(device)
             else:
                 position_ids = (attention_mask.long().cumsum(-1) - 1).clamp(min=0)
+
+            # Trim leading all-padding columns so L matches actual content length,
+            # mirroring WatermarkKDCollator's dynamic-pad behavior in offline KD.
+            # Only left-trim: right side contains response tokens indexed by response_length.
+            col_has_content = attention_mask.any(dim=0)  # (L,)
+            if col_has_content.any():
+                first_real = col_has_content.nonzero(as_tuple=False)[0].item()
+                if first_real > 0:
+                    input_ids      = input_ids[:, first_real:]
+                    attention_mask = attention_mask[:, first_real:]
+                    position_ids   = position_ids[:, first_real:]
 
             # Derive loss_mask from response span
             response_length = batch["responses"].shape[1]
@@ -160,14 +185,42 @@ class WatermarkOnPolicyWorker(WatermarkActorRolloutRefWorker):
             else:
                 green_masks = None
 
-            # --- On-policy: ref and actor forward on the SAME sequences ---
-            # input_ids_ref = input_ids (both see the in-context watermark prompt + rollout)
-            input_ids_ref      = input_ids
-            attention_mask_ref = attention_mask
-            position_ids_ref   = position_ids
-            loss_mask_ref      = loss_mask
+            # --- Build ref sequences: [clean_prompt | same_response] per sample ---
+            # Clean prompt comes from non_tensor_batch["raw_prompt_ids_ref"] (list[int] per sample).
+            # Response tokens are extracted from the actor's input_ids (right-most R positions).
+            if need_ref_forward:
+                pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+                resp_tokens = input_ids[:, -response_length:]       # (N, R)
+                resp_attn   = attention_mask[:, -response_length:]  # (N, R)
 
-            # --- Shifted tensors for next-token prediction ---
+                ref_seqs, ref_attns = [], []
+                for i in range(N):
+                    prompt_ref_ids = torch.tensor(
+                        list(data.non_tensor_batch["raw_prompt_ids_ref"][i]),
+                        dtype=torch.long, device=device,
+                    )
+                    ref_seq  = torch.cat([prompt_ref_ids, resp_tokens[i]])
+                    ref_attn = torch.cat([
+                        torch.ones(prompt_ref_ids.shape[0], dtype=torch.long, device=device),
+                        resp_attn[i],
+                    ])
+                    ref_seqs.append(ref_seq)
+                    ref_attns.append(ref_attn)
+
+                # Left-pad ref sequences to max length in this batch
+                max_ref_len = max(s.shape[0] for s in ref_seqs)
+                input_ids_ref      = torch.full((N, max_ref_len), pad_token_id, dtype=torch.long, device=device)
+                attention_mask_ref = torch.zeros((N, max_ref_len), dtype=torch.long, device=device)
+                for i, (seq, attn) in enumerate(zip(ref_seqs, ref_attns)):
+                    pad = max_ref_len - seq.shape[0]
+                    input_ids_ref[i, pad:]      = seq
+                    attention_mask_ref[i, pad:] = attn
+
+                position_ids_ref = (attention_mask_ref.long().cumsum(-1) - 1).clamp(min=0)
+                loss_mask_ref    = _build_loss_mask_from_response(attention_mask_ref, response_length)
+                L_ref            = max_ref_len
+
+            # --- Shifted actor tensors for next-token prediction ---
             input_ids_rolled_flat = input_ids[:, 1:].contiguous().view(-1)   # (N*(L-1),)
             loss_mask_flat        = loss_mask[:, 1:].contiguous().view(-1)   # (N*(L-1),)
             sample_index = (
@@ -181,15 +234,12 @@ class WatermarkOnPolicyWorker(WatermarkActorRolloutRefWorker):
             )
             batch_num_tokens_val = batch_num_tokens_local.item()
 
-            resp_idx = loss_mask_flat.bool()
-
-            # Sanity: actor and ref select same positions (they are the same tensor)
+            # Sanity: actor and ref response token counts must match
             if need_ref_forward:
                 loss_mask_ref_flat = loss_mask_ref[:, 1:].contiguous().view(-1)
-                resp_idx_ref = loss_mask_ref_flat.bool()
-                assert resp_idx.sum() == resp_idx_ref.sum(), (
+                assert loss_mask_flat.sum() == loss_mask_ref_flat.sum(), (
                     f"Actor/ref response token count mismatch: "
-                    f"{resp_idx.sum()} vs {resp_idx_ref.sum()}"
+                    f"{loss_mask_flat.sum()} vs {loss_mask_ref_flat.sum()}"
                 )
 
             # --- Gradient accumulation loop ---
@@ -221,16 +271,22 @@ class WatermarkOnPolicyWorker(WatermarkActorRolloutRefWorker):
 
                 with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
                     if need_ref_forward:
+                        mb_input_ids_ref      = input_ids_ref[s:e]
+                        mb_attention_mask_ref = attention_mask_ref[s:e]
+                        mb_position_ids_ref   = position_ids_ref[s:e]
+                        mb_loss_mask_ref_flat = loss_mask_ref[s:e, 1:].contiguous().view(-1)
+                        mb_resp_idx_ref       = mb_loss_mask_ref_flat.bool()
+
                         with torch.no_grad():
                             ref_output = self.ref_module_fsdp(
-                                input_ids=mb_input_ids,
-                                attention_mask=mb_attention_mask,
-                                position_ids=mb_position_ids,
+                                input_ids=mb_input_ids_ref,
+                                attention_mask=mb_attention_mask_ref,
+                                position_ids=mb_position_ids_ref,
                                 use_cache=False,
                             )
-                            mb_chunk_len = mb_N * (L - 1)
+                            mb_chunk_len_ref = mb_N * (L_ref - 1)
                             mb_ref_logits = (
-                                ref_output.logits[:, :-1].contiguous().view(mb_chunk_len, -1)[mb_resp_idx]
+                                ref_output.logits[:, :-1].contiguous().view(mb_chunk_len_ref, -1)[mb_resp_idx_ref]
                             )
                             del ref_output
 
@@ -266,7 +322,9 @@ class WatermarkOnPolicyWorker(WatermarkActorRolloutRefWorker):
                         kl_biased_ref_actor_weight=kl_biased_ref_actor_weight,
                         reverse_kl_biased_ref_actor_weight=reverse_kl_biased_ref_actor_weight,
                         kl_ref_actor_weight=kl_ref_actor_weight,
+                        reverse_kl_ref_actor_weight=reverse_kl_ref_actor_weight,
                         kl_biased_actor_actor_weight=kl_biased_actor_actor_weight,
+                        reverse_kl_biased_actor_actor_weight=reverse_kl_biased_actor_actor_weight,
                         batch_num_tokens=batch_num_tokens_val,
                         dp_size=self.world_size,
                         english_vocab_mask=english_vocab_mask,

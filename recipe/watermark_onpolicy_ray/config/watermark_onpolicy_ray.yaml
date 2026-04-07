@@ -70,7 +70,7 @@ actor_rollout_ref:
     response_length: 600
     prompt_length: 81920
     dtype: bfloat16
-    gpu_memory_utilization: 0.95
+    gpu_memory_utilization: 0.90
     tensor_model_parallel_size: 8
     enforce_eager: false
     enable_chunked_prefill: true
@@ -132,10 +132,12 @@ watermark:
   # (CE would become self-imitation on rollout tokens — different semantics)
   ce_loss_weight: 0.0
   green_loss_weight: 0.0
-  kl_biased_ref_actor_weight: 1.0        # KL(D̂_ref ‖ D_actor): biased ref as teacher
+  kl_biased_ref_actor_weight: 0.0        # KL(D̂_ref ‖ D_actor): biased ref as teacher
   reverse_kl_biased_ref_actor_weight: 0.0
-  kl_ref_actor_weight: 0.0               # KL(D_ref ‖ D_actor): stability anchor
-  kl_biased_actor_actor_weight: 0.0
+  kl_ref_actor_weight: 0.0               # KL(D_ref ‖ D_actor): forward quality anchor
+  reverse_kl_ref_actor_weight: 0.0      # KL(D_actor ‖ D_ref): reverse quality anchor
+  kl_biased_actor_actor_weight: 0.0       # KL(stopgrad(D̂_actor) ‖ D_actor): forward self-distill
+  reverse_kl_biased_actor_actor_weight: 0.0  # KL(D_actor ‖ stopgrad(D̂_actor)): reverse self-distill
   green_target_ratio: 0.0
   max_grad_norm: 1.0
   gradient_accumulation_steps: 1
