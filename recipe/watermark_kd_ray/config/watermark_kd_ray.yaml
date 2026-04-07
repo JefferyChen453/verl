@@ -135,6 +135,7 @@ watermark:
   reverse_kl_ref_actor_weight: 0.0       # KL(D_actor ‖ D_ref): reverse quality anchor
   kl_biased_actor_actor_weight: 0.0              # KL(stopgrad(D̂_actor) ‖ D_actor): forward self-distill
   reverse_kl_biased_actor_actor_weight: 0.0     # KL(D_actor ‖ stopgrad(D̂_actor)): reverse self-distill
+  quality_green_topk: 0                        # >0: self-distill uses green ∩ ref_topk bias (needs ref)
   green_target_ratio: 0.0            # fraction-relative hinge; 0.0 = disabled. E.g. 2.0 means target = 2 * fraction_i per sample
   max_grad_norm: 1.0
   gradient_accumulation_steps: 1

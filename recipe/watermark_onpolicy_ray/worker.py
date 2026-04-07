@@ -102,6 +102,7 @@ class WatermarkOnPolicyWorker(WatermarkActorRolloutRefWorker):
         max_grad_norm                     = float(wm_cfg.get("max_grad_norm", 1.0))
         grad_accum_steps                  = int(wm_cfg.get("gradient_accumulation_steps", 1))
         green_target_ratio                = float(wm_cfg.get("green_target_ratio", 0.0))
+        quality_green_topk                = int(wm_cfg.get("quality_green_topk", 0))
 
         need_green_masks = (
             green_loss_weight > 0
@@ -115,6 +116,7 @@ class WatermarkOnPolicyWorker(WatermarkActorRolloutRefWorker):
             or reverse_kl_biased_ref_actor_weight > 0
             or kl_ref_actor_weight > 0
             or reverse_kl_ref_actor_weight > 0
+            or quality_green_topk > 0
         )
         if need_ref_forward:
             assert self._is_ref, (
@@ -330,6 +332,7 @@ class WatermarkOnPolicyWorker(WatermarkActorRolloutRefWorker):
                         english_vocab_mask=english_vocab_mask,
                         green_target_ratio=green_target_ratio,
                         sample_fractions=mb_fractions,
+                        quality_green_topk=quality_green_topk,
                     )
 
                     loss.backward()

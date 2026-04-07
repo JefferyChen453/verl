@@ -109,13 +109,14 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
         super()._build_rollout(trust_remote_code=trust_remote_code)
 
     def _need_ref_model(self) -> bool:
-        """Check if any ref-dependent loss term is enabled in watermark config."""
+        """Check if any ref-dependent loss term or feature is enabled."""
         wm_cfg = self.config.get("watermark", {})
         return (
             float(wm_cfg.get("kl_biased_ref_actor_weight", 0.0)) > 0
             or float(wm_cfg.get("reverse_kl_biased_ref_actor_weight", 0.0)) > 0
             or float(wm_cfg.get("kl_ref_actor_weight", 0.0)) > 0
             or float(wm_cfg.get("reverse_kl_ref_actor_weight", 0.0)) > 0
+            or int(wm_cfg.get("quality_green_topk", 0)) > 0
         )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -232,8 +233,9 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
         max_grad_norm                = float(wm_cfg.get("max_grad_norm", 1.0))
         grad_accum_steps             = int(wm_cfg.get("gradient_accumulation_steps", 1))
         green_target_ratio           = float(wm_cfg.get("green_target_ratio", 0.0))
+        quality_green_topk           = int(wm_cfg.get("quality_green_topk", 0))
         need_green_masks = green_loss_weight > 0 or kl_biased_ref_actor_weight > 0 or reverse_kl_biased_ref_actor_weight > 0 or kl_biased_actor_actor_weight > 0 or reverse_kl_biased_actor_actor_weight > 0
-        need_ref_forward = kl_biased_ref_actor_weight > 0 or reverse_kl_biased_ref_actor_weight > 0 or kl_ref_actor_weight > 0 or reverse_kl_ref_actor_weight > 0
+        need_ref_forward = kl_biased_ref_actor_weight > 0 or reverse_kl_biased_ref_actor_weight > 0 or kl_ref_actor_weight > 0 or reverse_kl_ref_actor_weight > 0 or quality_green_topk > 0
         if need_ref_forward:
             assert self._is_ref, (
                 "Ref-dependent loss terms are enabled but ref model was not loaded. "
@@ -417,6 +419,7 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                         english_vocab_mask=english_vocab_mask,
                         green_target_ratio=green_target_ratio,
                         sample_fractions=mb_fractions,
+                        quality_green_topk=quality_green_topk,
                     )
 
                     loss.backward()
