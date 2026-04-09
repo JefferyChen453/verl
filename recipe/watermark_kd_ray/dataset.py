@@ -2,12 +2,16 @@
 WatermarkKDDataset — dataset for watermark KD training.
 
 Reads pre-formatted chat-template strings from parquet and tokenizes:
-  - Actor inputs  : "prompt"                (incontext wm system prompt) + response
-  - Ref inputs    : "prompt_no_incontext_wm" (clean system prompt)       + response
+  - Actor inputs  : config.prompt_column           (default "prompt")
+  - Ref inputs    : config.ref_prompt_column       (default "prompt_no_incontext_wm")
 
 Both prompts are already apply_chat_template-formatted strings (produced by
-data_process/jsonl_to_parquet_file.py), so they are tokenized directly without
-a second chat-template application.
+data_process/jsonl_to_parquet_file.py or v1_jsonl_to_parquet.py), so they are
+tokenized directly without a second chat-template application.
+
+For the offline KD pipeline the ref prompt column is the *clean* prompt
+(no incontext wm). For the V1 + privileged-GT paradigm it is the wm prompt
++ GT example, set via dataset.ref_prompt_column=prompt_ref in the run script.
 
 Per-sample watermark seed/fraction are read from the "seed"/"fraction" columns.
 """
@@ -42,6 +46,8 @@ class WatermarkKDDataset(Dataset):
         self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         self.max_length = int(config.get("max_length", 8192))
         self.truncation = config.get("truncation", "right")
+        prompt_column = config.get("prompt_column", "prompt")
+        ref_prompt_column = config.get("ref_prompt_column", "prompt_no_incontext_wm")
 
         if isinstance(parquet_files, str):
             parquet_files = [parquet_files]
@@ -52,16 +58,26 @@ class WatermarkKDDataset(Dataset):
             dfs.append(pd.read_parquet(local))
         df = pd.concat(dfs, ignore_index=True)
 
+        for col in (prompt_column, ref_prompt_column, "response", "seed", "fraction"):
+            if col not in df.columns:
+                raise KeyError(
+                    f"WatermarkKDDataset: required column '{col}' missing from parquet. "
+                    f"Available columns: {list(df.columns)}"
+                )
+
         total = len(df)
         if max_samples > 0 and max_samples < total:
             rng = np.random.default_rng(42)
             idx = rng.choice(total, size=max_samples, replace=False)
             df = df.iloc[idx.tolist()]
             print(f"WatermarkKDDataset: selected {max_samples} / {total} samples")
-        print(f"WatermarkKDDataset: {len(df)} samples loaded")
+        print(
+            f"WatermarkKDDataset: {len(df)} samples loaded "
+            f"(prompt_column={prompt_column!r}, ref_prompt_column={ref_prompt_column!r})"
+        )
 
-        self.prompts = df["prompt"].tolist()
-        self.prompts_ref = df["prompt_no_incontext_wm"].tolist()
+        self.prompts = df[prompt_column].tolist()
+        self.prompts_ref = df[ref_prompt_column].tolist()
         self.responses = df["response"].tolist()
         self.wm_seeds = df["seed"].tolist()
         self.wm_fractions = df["fraction"].tolist()
