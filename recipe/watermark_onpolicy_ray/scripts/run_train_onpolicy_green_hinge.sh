@@ -23,12 +23,12 @@ python -m recipe.watermark_onpolicy_ray.main \
     data.val_batch_size=128 \
     actor_rollout_ref.rollout.n=1 \
     watermark.ce_loss_weight=0.0 \
-    watermark.green_loss_weight=1.0 \
+    watermark.green_loss_weight=0.8 \
     watermark.green_target_ratio=1.4 \
     watermark.kl_biased_ref_actor_weight=0.0 \
     watermark.reverse_kl_biased_ref_actor_weight=0.0 \
     watermark.kl_ref_actor_weight=0.0 \
-    watermark.reverse_kl_ref_actor_weight=1.0 \
+    watermark.reverse_kl_ref_actor_weight=0.2 \
     watermark.kl_biased_actor_actor_weight=0.0 \
     watermark.reverse_kl_biased_actor_actor_weight=0.0 \
     watermark.quality_green_topk=0 \
@@ -43,4 +43,4 @@ python -m recipe.watermark_onpolicy_ray.main \
     trainer.save_freq=after_each_epoch \
     trainer.val_before_train=true \
     trainer.project_name=watermark-kd-ray \
-    trainer.experiment_name="onpolicy_strength_3.0_bsz_8__1.0seq_green_hinge1.4_1.0reverse_kl_ref_$(date +%Y%m%d%H%M)"
+    trainer.experiment_name="onpolicy_strength_3.0_bsz_8__0.8seq_green_hinge1.4_0.2reverse_kl_ref_$(date +%Y%m%d%H%M)"
