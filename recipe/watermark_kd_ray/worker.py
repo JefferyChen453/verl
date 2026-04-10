@@ -234,7 +234,21 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
         grad_accum_steps             = int(wm_cfg.get("gradient_accumulation_steps", 1))
         green_target_ratio           = float(wm_cfg.get("green_target_ratio", 0.0))
         quality_green_topk           = int(wm_cfg.get("quality_green_topk", 0))
-        need_green_masks = green_loss_weight > 0 or kl_biased_ref_actor_weight > 0 or reverse_kl_biased_ref_actor_weight > 0 or kl_biased_actor_actor_weight > 0 or reverse_kl_biased_actor_actor_weight > 0
+        # NOTE: kl_ref_actor / reverse_kl_ref_actor mathematically don't need
+        # green masks for the loss term itself, but loss.py derives num_samples
+        # from green_masks.shape[0] to drive the per-sample loop. Including these
+        # weights here ensures the loop actually iterates when *only* clean KL
+        # terms are active (otherwise num_samples=0, the loop skips, and the
+        # loss tensor never gets a grad_fn → backward fails).
+        need_green_masks = (
+            green_loss_weight > 0
+            or kl_biased_ref_actor_weight > 0
+            or reverse_kl_biased_ref_actor_weight > 0
+            or kl_ref_actor_weight > 0
+            or reverse_kl_ref_actor_weight > 0
+            or kl_biased_actor_actor_weight > 0
+            or reverse_kl_biased_actor_actor_weight > 0
+        )
         need_ref_forward = kl_biased_ref_actor_weight > 0 or reverse_kl_biased_ref_actor_weight > 0 or kl_ref_actor_weight > 0 or reverse_kl_ref_actor_weight > 0 or quality_green_topk > 0
         if need_ref_forward:
             assert self._is_ref, (
