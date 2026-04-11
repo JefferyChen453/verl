@@ -23,6 +23,18 @@ Notation:
 - KL(D_actor ‖ D_ref):             reverse KD stability anchor (mode-seeking, no watermark)
 - KL(stopgrad(D̂_actor) ‖ D_actor): forward self-distillation (mean-seeking), teacher stopgraded
 - KL(D_actor ‖ stopgrad(D̂_actor)): reverse self-distillation (mode-seeking), teacher stopgraded
+
+Per-sample pos/neg routing
+--------------------------
+When ``sample_is_negative`` is supplied (per-sample bool), the loop uses a hard
+dispatch:
+  - Positive samples (is_negative[i] == False): run L_green, KL biased_ref
+    (fwd/rev), and the biased self-distill terms. Skip clean-ref KL terms.
+  - Negative samples (is_negative[i] == True): run only the clean-ref KL terms
+    (``KL(D_ref ‖ D_actor)`` and reverse). Skip all biased-teacher terms.
+L_CE (if enabled) applies to all samples. The batch normalizer is still the
+total response-token count, so pos/neg terms are naturally weighted by their
+token share.
 """
 
 from typing import Optional
@@ -52,6 +64,7 @@ def compute_watermark_kd_loss(
     green_target_ratio: float = 0.0,
     sample_fractions: Optional[torch.Tensor] = None,
     quality_green_topk: int = 0,
+    sample_is_negative: Optional[torch.Tensor] = None,
 ):
     """
     Compute combined watermark KD loss on response-only flattened tensors.
@@ -137,20 +150,33 @@ def compute_watermark_kd_loss(
             if token_mask.sum() == 0:
                 continue
 
+            # Per-sample pos/neg routing
+            is_neg_i = sample_is_negative is not None and bool(sample_is_negative[i])
+            # Pos-only: biased_ref KL (fwd/rev), green loss, biased self-distill
+            run_biased_ref = need_kl_biased_ref and not is_neg_i
+            run_reverse_biased_ref = need_reverse_kl_biased_ref and not is_neg_i
+            run_green = need_green and not is_neg_i
+            run_kl_biased_actor = need_kl_biased_actor and not is_neg_i
+            run_reverse_kl_biased_actor = need_reverse_kl_biased_actor and not is_neg_i
+            # Neg-only: clean ref KL (fwd/rev)
+            run_kl_ref = need_kl_ref and is_neg_i
+            run_reverse_kl_ref = need_reverse_kl_ref and is_neg_i
+
             # Shared indexing per sample
             sample_log_q = log_probs_all[token_mask]  # (n_tokens, V)
 
-            if need_green_bias:
+            need_green_bias_i = run_biased_ref or run_reverse_biased_ref or run_kl_biased_actor or run_reverse_kl_biased_actor
+            if need_green_bias_i:
                 green_bias = strength * green_masks[i].float().unsqueeze(0)  # (1, V)
                 if english_vocab_mask is not None:
                     green_bias_eng = green_bias[:, english_vocab_mask]          # (1, E)
 
             # English-only actor logits slice (reused across KL terms if english_vocab_mask set)
-            if english_vocab_mask is not None and (need_kl_biased_ref or need_reverse_kl_biased_ref or need_kl_ref or need_reverse_kl_ref or need_kl_biased_actor or need_reverse_kl_biased_actor):
+            if english_vocab_mask is not None and (run_biased_ref or run_reverse_biased_ref or run_kl_ref or run_reverse_kl_ref or run_kl_biased_actor or run_reverse_kl_biased_actor):
                 actor_logits_eng = actor_logits[token_mask][:, english_vocab_mask]  # (n, E)
 
             # L_green
-            if need_green:
+            if run_green:
                 sample_probs = actor_probs[token_mask]
                 green_prob = sample_probs[:, green_masks[i]].sum(dim=-1).clamp(min=1e-8)
                 if use_green_hinge:
@@ -162,9 +188,13 @@ def compute_watermark_kd_loss(
                     per_token_loss = -torch.log(green_prob)
                     l_green_total = l_green_total + per_token_loss.sum()
 
-            # KL(D̂_ref ‖ D_actor)
-            if need_kl_biased_ref:
+            # Cache sample_ref once if any ref-dependent term runs for this sample.
+            _need_sample_ref_i = run_biased_ref or run_reverse_biased_ref or run_kl_ref or run_reverse_kl_ref
+            if _need_sample_ref_i:
                 sample_ref = ref_logits[token_mask]
+
+            # KL(D̂_ref ‖ D_actor)
+            if run_biased_ref:
                 if english_vocab_mask is not None:
                     log_p = F.log_softmax(sample_ref[:, english_vocab_mask] + green_bias_eng, dim=-1)
                     log_q = F.log_softmax(actor_logits_eng, dim=-1)
@@ -176,8 +206,7 @@ def compute_watermark_kd_loss(
                 l_kl_biased_ref_total = l_kl_biased_ref_total + kl_per_token.sum()
 
             # KL(D_actor ‖ D̂_ref)  — reverse biased ref
-            if need_reverse_kl_biased_ref:
-                sample_ref = ref_logits[token_mask] if not need_kl_biased_ref else sample_ref
+            if run_reverse_biased_ref:
                 if english_vocab_mask is not None:
                     log_p = F.log_softmax(actor_logits_eng, dim=-1)
                     log_q = F.log_softmax(sample_ref[:, english_vocab_mask] + green_bias_eng, dim=-1)
@@ -188,9 +217,8 @@ def compute_watermark_kd_loss(
                 kl_per_token = torch.sum(p * (log_p - log_q), dim=-1)
                 l_kl_biased_ref_rev_total = l_kl_biased_ref_rev_total + kl_per_token.sum()
 
-            # KL(D_ref ‖ D_actor) — forward quality anchor
-            if need_kl_ref:
-                sample_ref = ref_logits[token_mask] if not need_kl_biased_ref else sample_ref
+            # KL(D_ref ‖ D_actor) — forward quality anchor (neg samples only)
+            if run_kl_ref:
                 if english_vocab_mask is not None:
                     log_p = F.log_softmax(sample_ref[:, english_vocab_mask], dim=-1)
                     log_q = F.log_softmax(actor_logits_eng, dim=-1)
@@ -201,9 +229,8 @@ def compute_watermark_kd_loss(
                 kl_per_token = torch.sum(p * (log_p - log_q), dim=-1)
                 l_kl_ref_total = l_kl_ref_total + kl_per_token.sum()
 
-            # KL(D_actor ‖ D_ref) — reverse quality anchor
-            if need_reverse_kl_ref:
-                sample_ref = ref_logits[token_mask] if not need_kl_biased_ref and not need_kl_ref else sample_ref
+            # KL(D_actor ‖ D_ref) — reverse quality anchor (neg samples only)
+            if run_reverse_kl_ref:
                 if english_vocab_mask is not None:
                     log_p = F.log_softmax(actor_logits_eng, dim=-1)
                     log_q = F.log_softmax(sample_ref[:, english_vocab_mask], dim=-1)
@@ -218,7 +245,7 @@ def compute_watermark_kd_loss(
             # When quality_green_topk > 0, replace uniform green_bias with
             # per-position bias on green ∩ ref_topk tokens only.
             # This teaches "increase green tokens that ref also approves of".
-            if quality_green_topk > 0 and (need_kl_biased_actor or need_reverse_kl_biased_actor):
+            if quality_green_topk > 0 and (run_kl_biased_actor or run_reverse_kl_biased_actor):
                 _ref_qg = ref_logits[token_mask]  # (n_tokens, V)
                 if english_vocab_mask is not None:
                     _ref_qg_sub = _ref_qg[:, english_vocab_mask]  # (n_tokens, E)
@@ -235,14 +262,14 @@ def compute_watermark_kd_loss(
                     sd_bias = strength * (_green_full & _topk_mask).float()  # (n_tokens, V)
             else:
                 # Fall back to uniform green bias (original behavior)
-                if need_kl_biased_actor or need_reverse_kl_biased_actor:
+                if run_kl_biased_actor or run_reverse_kl_biased_actor:
                     if english_vocab_mask is not None:
                         sd_bias_eng = green_bias_eng  # (1, E) broadcast
                     else:
                         sd_bias = green_bias  # (1, V) broadcast
 
             # KL(stopgrad(D̂_actor) ‖ D_actor) — forward self-distillation
-            if need_kl_biased_actor:
+            if run_kl_biased_actor:
                 if english_vocab_mask is not None:
                     log_p = F.log_softmax(actor_logits_eng.detach() + sd_bias_eng, dim=-1)
                     log_q = F.log_softmax(actor_logits_eng, dim=-1)
@@ -254,7 +281,7 @@ def compute_watermark_kd_loss(
                 l_kl_ba_total = l_kl_ba_total + kl_per_token.sum()
 
             # KL(D_actor ‖ stopgrad(D̂_actor)) — reverse self-distillation
-            if need_reverse_kl_biased_actor:
+            if run_reverse_kl_biased_actor:
                 if english_vocab_mask is not None:
                     log_p = F.log_softmax(actor_logits_eng, dim=-1)
                     log_q = F.log_softmax(actor_logits_eng.detach() + sd_bias_eng, dim=-1)
@@ -302,22 +329,32 @@ def compute_watermark_kd_loss(
             metrics["kl_biased_actor_actor_reverse"] = l_kl_biased_actor_actor_reverse.detach().item()
 
     # ---- Always: green prob metrics (no grad, independent of loss weights) ----
+    # Averaged over POSITIVE sample tokens only; neg samples have fraction=0
+    # (empty green mask) so including them would produce degenerate values.
     with torch.no_grad():
         _probs = log_probs_all.detach().exp()
         _raw_sum = torch.tensor(0.0, device=actor_logits.device)
         _ratio_sum = torch.tensor(0.0, device=actor_logits.device)
+        _pos_token_count = torch.tensor(0.0, device=actor_logits.device)
         for i in range(num_samples):
+            if sample_is_negative is not None and bool(sample_is_negative[i]):
+                continue
             _mask = sample_index == i
-            if _mask.sum() == 0:
+            n_mask = _mask.sum()
+            if n_mask == 0:
                 continue
             _gp = _probs[_mask][:, green_masks[i]].sum(dim=-1)
             _raw_sum += _gp.sum()
+            _pos_token_count += n_mask
             if sample_fractions is not None:
                 _ratio_sum += (_gp / sample_fractions[i]).sum()
-        total_tokens_this_rank = batch_num_tokens / dp_size
-        metrics["avg_green_prob"] = (_raw_sum / total_tokens_this_rank).item()
+        # Normalize by positive-sample token count so metric is comparable
+        # across batches with varying pos/neg ratios. Fall back to 1.0 if no
+        # pos samples (rare, shouldn't happen with pos >> neg setup).
+        _denom = _pos_token_count.clamp(min=1.0)
+        metrics["avg_green_prob"] = (_raw_sum / _denom).item()
         if sample_fractions is not None:
-            metrics["avg_green_prob_ratio"] = (_ratio_sum / total_tokens_this_rank).item()
+            metrics["avg_green_prob_ratio"] = (_ratio_sum / _denom).item()
 
     metrics["total_loss"] = loss.detach().item()
     return loss, metrics

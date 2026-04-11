@@ -205,13 +205,13 @@ class WatermarkKDCollator:
     Pads and stacks both actor sequence tensors (input_ids, …) and ref sequence
     tensors (input_ids_ref, …) independently — they may have different lengths
     because the incontext-wm prompt is longer than the clean prompt.
-    Scalar tensors (wm_seed, wm_fraction) are stacked normally.
+    Scalar tensors (wm_seed, wm_fraction, is_negative) are stacked normally.
     """
 
     # Actor and ref sequences padded independently (may differ in max length)
     SEQ_KEYS = ("input_ids", "loss_mask", "attention_mask", "position_ids")
     SEQ_KEYS_REF = ("input_ids_ref", "loss_mask_ref", "attention_mask_ref", "position_ids_ref")
-    SCALAR_KEYS = ("wm_seed", "wm_fraction")
+    SCALAR_KEYS = ("wm_seed", "wm_fraction", "is_negative")
     PAD_VALUES = {
         "input_ids": None,      # uses pad_token_id
         "loss_mask": 0,

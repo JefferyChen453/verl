@@ -214,6 +214,8 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
         Optional:
             position_ids         (N, L_actor)  long
             position_ids_ref     (N, L_ref)    long
+            is_negative          (N,)          bool  — if True, route sample to clean-ref
+                                                       KL terms instead of biased-ref KL
 
         Returns DataProto with meta_info["metrics"] containing:
             total_loss, ce_loss, green_loss, kl_loss, avg_green_prob, grad_norm, lr
@@ -299,6 +301,12 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
             else:
                 green_masks = None
 
+            # Per-sample pos/neg routing flag (defaults to all-False if absent)
+            if "is_negative" in batch.keys():
+                is_negative_all = batch["is_negative"].to(device).bool()  # (N,)
+            else:
+                is_negative_all = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=device)
+
             if need_ref_forward:
 
                 # --- Unpack ref inputs (clean prompt, same response, may differ in length) ---
@@ -368,6 +376,7 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
 
                 mb_green_masks = green_masks[s:e] if need_green_masks else None
                 mb_fractions = wm_fractions[s:e] if need_green_masks else None
+                mb_is_negative = is_negative_all[s:e]
 
                 with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
                     if need_ref_forward:
@@ -434,6 +443,7 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                         green_target_ratio=green_target_ratio,
                         sample_fractions=mb_fractions,
                         quality_green_topk=quality_green_topk,
+                        sample_is_negative=mb_is_negative,
                     )
 
                     loss.backward()

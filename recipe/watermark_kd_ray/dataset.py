@@ -14,11 +14,19 @@ For the offline KD pipeline the ref prompt column is the *clean* prompt
 + GT example, set via dataset.ref_prompt_column=prompt_ref in the run script.
 
 Per-sample watermark seed/fraction are read from the "seed"/"fraction" columns.
+
+Mixed pos+neg training: rows with ``z_score == NEG_SENTINEL`` (-99999) are
+treated as negative samples (clean prompt, clean response). For these rows the
+loss function routes training to clean-ref KL terms instead of biased-ref KL,
+giving actor a safety anchor on non-watermarked inputs.
 """
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+
+NEG_SENTINEL = -99999.0
 
 
 class WatermarkKDDataset(Dataset):
@@ -36,6 +44,7 @@ class WatermarkKDDataset(Dataset):
         loss_mask_ref       (L_ref,)    float
         wm_seed             ()          long
         wm_fraction         ()          float
+        is_negative         ()          bool  — True if this is a negative (clean) sample
     """
 
     def __init__(self, parquet_files, tokenizer, config, max_samples: int = -1):
@@ -71,16 +80,24 @@ class WatermarkKDDataset(Dataset):
             idx = rng.choice(total, size=max_samples, replace=False)
             df = df.iloc[idx.tolist()]
             print(f"WatermarkKDDataset: selected {max_samples} / {total} samples")
-        print(
-            f"WatermarkKDDataset: {len(df)} samples loaded "
-            f"(prompt_column={prompt_column!r}, ref_prompt_column={ref_prompt_column!r})"
-        )
 
         self.prompts = df[prompt_column].tolist()
         self.prompts_ref = df[ref_prompt_column].tolist()
         self.responses = df["response"].tolist()
         self.wm_seeds = df["seed"].tolist()
         self.wm_fractions = df["fraction"].tolist()
+
+        if "z_score" in df.columns:
+            z_scores = df["z_score"].to_numpy()
+            self.is_negatives = (z_scores == NEG_SENTINEL).tolist()
+        else:
+            self.is_negatives = [False] * len(df)
+        n_neg = int(sum(self.is_negatives))
+        print(
+            f"WatermarkKDDataset: {len(df)} samples loaded "
+            f"(pos={len(df) - n_neg}, neg={n_neg}, "
+            f"prompt_column={prompt_column!r}, ref_prompt_column={ref_prompt_column!r})"
+        )
 
     def __len__(self):
         return len(self.prompts)
@@ -163,4 +180,5 @@ class WatermarkKDDataset(Dataset):
             "loss_mask_ref": loss_mask_ref,
             "wm_seed": torch.tensor(int(self.wm_seeds[item]), dtype=torch.long),
             "wm_fraction": torch.tensor(float(self.wm_fractions[item]), dtype=torch.float32),
+            "is_negative": torch.tensor(bool(self.is_negatives[item]), dtype=torch.bool),
         }
