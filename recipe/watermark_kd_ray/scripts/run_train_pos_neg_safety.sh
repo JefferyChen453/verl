@@ -7,7 +7,14 @@ export PYTHONWARNINGS="ignore::UserWarning:hydra._internal"
 # Per-sample hard dispatch is handled inside compute_watermark_kd_loss via
 # the is_negative flag carried through dataset → collator → worker.
 
-python -m recipe.watermark_kd_ray.main \
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERL_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+PROJECT_ROOT="$(cd "$VERL_ROOT/.." && pwd)"
+PYTHON="$PROJECT_ROOT/.venv/bin/python"
+export PYTHONPATH="$PROJECT_ROOT:$VERL_ROOT:${PYTHONPATH}"
+cd "$VERL_ROOT"
+
+"$PYTHON" -m recipe.watermark_kd_ray.main \
     actor_rollout_ref.model.path=Qwen/Qwen3-14B \
     +actor_rollout_ref.model.override_config.rope_scaling.rope_type=yarn \
     +actor_rollout_ref.model.override_config.rope_scaling.factor=4.0 \
