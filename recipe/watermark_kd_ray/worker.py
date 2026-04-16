@@ -440,6 +440,7 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                 mb_sample_strengths = (
                     per_sample_strengths[s:e] if per_sample_strengths is not None else None
                 )
+                mb_task_ids = task_ids_all[s:e] if task_ids_all is not None else None
 
                 with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
                     if need_ref_forward:
@@ -508,17 +509,36 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                         quality_green_topk=quality_green_topk,
                         sample_is_negative=mb_is_negative,
                         sample_strengths=mb_sample_strengths,
+                        sample_task_ids=mb_task_ids,
                     )
 
                     loss.backward()
 
                 accumulated_metrics.append(mb_metrics)
 
-            # Aggregate metrics: loss terms are normalized by total tokens, safe to sum.
-            # avg_green_prob is a per-micro-batch average; divide to get overall average.
-            metrics = {k: sum(m[k] for m in accumulated_metrics) for k in accumulated_metrics[0]}
-            if "avg_green_prob" in metrics:
-                metrics["avg_green_prob"] /= grad_accum_steps
+            # Aggregate metrics. Loss terms are normalized by total batch tokens
+            # (summing across mbs is correct). Per-task ``avg_*`` metrics are
+            # per-mb averages, so we take the mean over the mbs that emitted
+            # them (missing on mbs that had no samples of that task).
+            all_keys = set()
+            for m in accumulated_metrics:
+                all_keys.update(m.keys())
+            metrics = {}
+            for k in all_keys:
+                vals = [m[k] for m in accumulated_metrics if k in m]
+                if k.startswith("avg_"):
+                    metrics[k] = sum(vals) / max(len(vals), 1)
+                else:
+                    metrics[k] = sum(vals)
+
+            # Fill missing per-task keys so cross-DP-rank concat doesn't fail
+            # (Ray protocol asserts identical key sets across ranks). Missing
+            # entries are recorded as 0.0 — biases cross-rank mean by the ratio
+            # of ranks that saw that task, but the per-task metric view stays
+            # present for all batches.
+            for task_bucket in ("green", "initial"):
+                for suffix in ("_prob", "_prob_ratio"):
+                    metrics.setdefault(f"avg_{task_bucket}{suffix}", 0.0)
 
             # --- Optimizer step ---
             grad_norm = torch.nn.utils.clip_grad_norm_(

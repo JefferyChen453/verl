@@ -66,6 +66,7 @@ def compute_watermark_kd_loss(
     quality_green_topk: int = 0,
     sample_is_negative: Optional[torch.Tensor] = None,
     sample_strengths: Optional[torch.Tensor] = None,
+    sample_task_ids: Optional[torch.Tensor] = None,
 ):
     """
     Compute combined watermark KD loss on response-only flattened tensors.
@@ -334,33 +335,59 @@ def compute_watermark_kd_loss(
             loss = loss + reverse_kl_biased_actor_actor_weight * l_kl_biased_actor_actor_reverse
             metrics["kl_biased_actor_actor_reverse"] = l_kl_biased_actor_actor_reverse.detach().item()
 
-    # ---- Always: green prob metrics (no grad, independent of loss weights) ----
-    # Averaged over POSITIVE sample tokens only; neg samples have fraction=0
-    # (empty green mask) so including them would produce degenerate values.
+    # ---- Per-task prob metrics (no grad, independent of loss weights) ----
+    # Two independent running totals: green-only and initials-only pos samples.
+    # Neg samples are skipped (fraction=0 → empty mask → degenerate ratio).
+    #
+    # Emitted keys (absent when corresponding task has no samples this batch):
+    #   avg_green_prob           mean actor green-mass on green pos
+    #   avg_green_prob_ratio     mean(p_green / fraction) on green pos
+    #   avg_initial_prob         mean actor green-mass on initials pos
+    #   avg_initial_prob_ratio   mean(p_green / γ) on initials pos
+    #
+    # Uses the dataset's task_id mapping (0=green, 1=initials, 2=neg). If
+    # sample_task_ids is None, everything falls back to the green bucket
+    # (preserves behavior for single-task runs without task_id column).
     with torch.no_grad():
         _probs = log_probs_all.detach().exp()
-        _raw_sum = torch.tensor(0.0, device=actor_logits.device)
-        _ratio_sum = torch.tensor(0.0, device=actor_logits.device)
-        _pos_token_count = torch.tensor(0.0, device=actor_logits.device)
+        buckets = {
+            "green":   {"raw": torch.tensor(0.0, device=actor_logits.device),
+                        "ratio": torch.tensor(0.0, device=actor_logits.device),
+                        "tok": torch.tensor(0.0, device=actor_logits.device)},
+            "initial": {"raw": torch.tensor(0.0, device=actor_logits.device),
+                        "ratio": torch.tensor(0.0, device=actor_logits.device),
+                        "tok": torch.tensor(0.0, device=actor_logits.device)},
+        }
+        # task_id → bucket name (None = skip, e.g. neg)
+        TID_TO_BUCKET = {0: "green", 1: "initial"}
+
         for i in range(num_samples):
             if sample_is_negative is not None and bool(sample_is_negative[i]):
                 continue
+            if sample_task_ids is not None:
+                bucket_name = TID_TO_BUCKET.get(int(sample_task_ids[i].item()))
+                if bucket_name is None:
+                    continue
+            else:
+                bucket_name = "green"  # fallback for single-task runs
             _mask = sample_index == i
             n_mask = _mask.sum()
             if n_mask == 0:
                 continue
             _gp = _probs[_mask][:, green_masks[i]].sum(dim=-1)
-            _raw_sum += _gp.sum()
-            _pos_token_count += n_mask
+            b = buckets[bucket_name]
+            b["raw"] += _gp.sum()
+            b["tok"] += n_mask
             if sample_fractions is not None:
-                _ratio_sum += (_gp / sample_fractions[i]).sum()
-        # Normalize by positive-sample token count so metric is comparable
-        # across batches with varying pos/neg ratios. Fall back to 1.0 if no
-        # pos samples (rare, shouldn't happen with pos >> neg setup).
-        _denom = _pos_token_count.clamp(min=1.0)
-        metrics["avg_green_prob"] = (_raw_sum / _denom).item()
-        if sample_fractions is not None:
-            metrics["avg_green_prob_ratio"] = (_ratio_sum / _denom).item()
+                b["ratio"] += (_gp / sample_fractions[i]).sum()
+
+        for bucket_name, b in buckets.items():
+            if b["tok"].item() == 0:
+                continue
+            denom = b["tok"].clamp(min=1.0)
+            metrics[f"avg_{bucket_name}_prob"] = (b["raw"] / denom).item()
+            if sample_fractions is not None:
+                metrics[f"avg_{bucket_name}_prob_ratio"] = (b["ratio"] / denom).item()
 
     metrics["total_loss"] = loss.detach().item()
     return loss, metrics
