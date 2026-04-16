@@ -244,10 +244,10 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
     #  Validation helpers                                                 #
     # ------------------------------------------------------------------ #
 
-    def _maybe_log_val_generations(self, inputs, outputs, scores, labels, lengths):
-        """Override: log first 10 val samples to a wandb table.
+    def _maybe_log_val_generations(self, inputs, outputs, scores, labels, lengths, tasks=None):
+        """Override: log a sample of val generations to a wandb table.
 
-        Columns: prefix (first 300 chars of input), completion, z_score.
+        Columns: prefix, completion, z_score, label, task, input_length.
         The full input_prompt is intentionally omitted as it is too long.
         """
         import random
@@ -262,14 +262,15 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
             if wandb.run is None:
                 return
 
-            table = wandb.Table(columns=["prefix", "completion", "z_score", "label", "input_length"])
+            table = wandb.Table(columns=["prefix", "completion", "z_score", "label", "task", "input_length"])
             for i in indices:
                 prefix = inputs[i]
                 completion = outputs[i]
                 z_score = scores[i]
                 label = labels[i]
+                task = tasks[i] if tasks is not None else "unknown"
                 length = lengths[i]
-                table.add_data(prefix, completion, z_score, label, length)
+                table.add_data(prefix, completion, z_score, label, task, length)
 
             wandb.log({"val/generations": table}, step=self.global_steps)
         except Exception as e:
@@ -496,7 +497,7 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
             )
 
         log_val_generations_start = perf_counter()
-        self._maybe_log_val_generations(inputs=sample_prefixes, outputs=sample_outputs, scores=z_scores, labels=sample_labels, lengths=sample_lengths)
+        self._maybe_log_val_generations(inputs=sample_prefixes, outputs=sample_outputs, scores=z_scores, labels=sample_labels, lengths=sample_lengths, tasks=sample_tasks)
         timing_totals["val/timing/log_val_generations_s"] += perf_counter() - log_val_generations_start
 
         reward_extra_infos_dict = {
