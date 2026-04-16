@@ -65,6 +65,7 @@ def compute_watermark_kd_loss(
     sample_fractions: Optional[torch.Tensor] = None,
     quality_green_topk: int = 0,
     sample_is_negative: Optional[torch.Tensor] = None,
+    sample_strengths: Optional[torch.Tensor] = None,
 ):
     """
     Compute combined watermark KD loss on response-only flattened tensors.
@@ -167,7 +168,12 @@ def compute_watermark_kd_loss(
 
             need_green_bias_i = run_biased_ref or run_reverse_biased_ref or run_kl_biased_actor or run_reverse_kl_biased_actor
             if need_green_bias_i:
-                green_bias = strength * green_masks[i].float().unsqueeze(0)  # (1, V)
+                s_i = (
+                    float(sample_strengths[i].item())
+                    if sample_strengths is not None
+                    else strength
+                )
+                green_bias = s_i * green_masks[i].float().unsqueeze(0)  # (1, V)
                 if english_vocab_mask is not None:
                     green_bias_eng = green_bias[:, english_vocab_mask]          # (1, E)
 
@@ -253,13 +259,13 @@ def compute_watermark_kd_loss(
                     _topk_mask = torch.zeros_like(_ref_qg_sub, dtype=torch.bool)
                     _topk_mask.scatter_(1, _topk_idx, True)
                     _green_eng = green_masks[i][english_vocab_mask].unsqueeze(0)  # (1, E)
-                    sd_bias_eng = strength * (_green_eng & _topk_mask).float()  # (n_tokens, E)
+                    sd_bias_eng = s_i * (_green_eng & _topk_mask).float()  # (n_tokens, E)
                 else:
                     _, _topk_idx = _ref_qg.topk(quality_green_topk, dim=-1)
                     _topk_mask = torch.zeros_like(_ref_qg, dtype=torch.bool)
                     _topk_mask.scatter_(1, _topk_idx, True)
                     _green_full = green_masks[i].unsqueeze(0)  # (1, V)
-                    sd_bias = strength * (_green_full & _topk_mask).float()  # (n_tokens, V)
+                    sd_bias = s_i * (_green_full & _topk_mask).float()  # (n_tokens, V)
             else:
                 # Fall back to uniform green bias (original behavior)
                 if run_kl_biased_actor or run_reverse_kl_biased_actor:

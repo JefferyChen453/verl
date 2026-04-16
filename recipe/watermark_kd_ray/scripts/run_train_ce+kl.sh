@@ -52,8 +52,8 @@ python -m recipe.watermark_kd_ray.main \
     watermark.kl_ref_actor_weight=0.2 \
     watermark.kl_biased_actor_actor_weight=0.0 \
     watermark.gradient_accumulation_steps=1 \
-    watermark.eval_wm_seed=1 \
-    watermark.eval_wm_fraction=0.2 \
+    watermark.eval_green_seed=1 \
+    watermark.eval_green_fraction=0.2 \
     watermark.strength=2.0 \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node=8 \

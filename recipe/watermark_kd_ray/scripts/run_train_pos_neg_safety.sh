@@ -33,8 +33,8 @@ cd "$VERL_ROOT"
     watermark.kl_ref_actor_weight=1.0 \
     watermark.kl_biased_actor_actor_weight=0.0 \
     watermark.gradient_accumulation_steps=1 \
-    watermark.eval_wm_seed=0 \
-    watermark.eval_wm_fraction=0.25 \
+    watermark.eval_green_seed=0 \
+    watermark.eval_green_fraction=0.25 \
     watermark.strength=5.0 \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node=8 \

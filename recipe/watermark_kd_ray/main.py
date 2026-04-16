@@ -129,12 +129,18 @@ class TaskRunner:
         from recipe.watermark_kd_ray.reward import WatermarkZScoreRewardFn
 
         val_reward_fn = WatermarkZScoreRewardFn(
-            wm_seed=config.watermark.get("eval_wm_seed", 1),
-            wm_fraction=config.watermark.get("eval_wm_fraction", 0.2),
+            tokenizer=tokenizer,
+            model_config=model_config,
             strength=config.watermark.get("strength", 2.0),
             only_english=config.watermark.get("only_english", True),
-            tokenizer=tokenizer,
-            model_config=model_config
+            stats_file=config.watermark.get(
+                "stats_file",
+                "data/initials_icw/leading_space_first_letter_stats.json",
+            ),
+            eval_tasks=list(config.watermark.get("eval_tasks", ["green"]) or ["green"]),
+            eval_green_seed=config.watermark.get("eval_green_seed", 1),
+            eval_green_fraction=config.watermark.get("eval_green_fraction", 0.25),
+            eval_initials_seed=config.watermark.get("eval_initials_seed", 0),
         )
 
         # ---- Trainer ----
@@ -211,7 +217,7 @@ class WatermarkKDCollator:
     # Actor and ref sequences padded independently (may differ in max length)
     SEQ_KEYS = ("input_ids", "loss_mask", "attention_mask", "position_ids")
     SEQ_KEYS_REF = ("input_ids_ref", "loss_mask_ref", "attention_mask_ref", "position_ids_ref")
-    SCALAR_KEYS = ("wm_seed", "wm_fraction", "is_negative")
+    SCALAR_KEYS = ("wm_seed", "wm_fraction", "is_negative", "task_id")
     PAD_VALUES = {
         "input_ids": None,      # uses pad_token_id
         "loss_mask": 0,

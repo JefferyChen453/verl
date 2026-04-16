@@ -14,6 +14,7 @@ generate_sequences() is inherited unchanged — vLLM handles eval rollouts.
 
 import os
 import sys
+from typing import Optional
 
 import torch
 
@@ -140,28 +141,54 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
     #  Green mask helpers (cached by (seed, fraction))                    #
     # ------------------------------------------------------------------ #
 
-    def _get_green_mask(self, seed: int, fraction: float) -> torch.Tensor:
-        """Return a cached boolean green-list mask for (seed, fraction)."""
+    def _get_green_mask(self, seed: int, fraction: float, task: str = "green") -> torch.Tensor:
+        """Return a cached boolean green-list mask for (task, seed, fraction).
+
+        Per-sample task dispatch:
+          - "green"    : classic fraction-based shuffled green list.
+          - "initials" : leading-space tokens whose first letter is in the
+                         per-seed 13-green-letter partition.
+                         The ``fraction`` arg is ignored (γ is stored for
+                         metric normalization).
+          - "neg"      : empty (all-False) mask — neg samples don't use a
+                         biased-ref term but we still provide a mask so
+                         tensor shapes align across the batch.
+        """
         if not hasattr(self, "_green_mask_cache"):
             self._green_mask_cache: dict = {}
 
-        key = (int(seed), round(float(fraction), 6))
+        wm_cfg = self.config.get("watermark", {})
+        key = (task, int(seed), round(float(fraction), 6))
         if key not in self._green_mask_cache:
-            from gptwm import _make_green_list_mask_numpy
-
             vocab_size = self.tokenizer.vocab_size
-            # actor_model_config is set by init_model() from _build_model_optimizer()
             model_emb_length = self.actor_model_config.vocab_size
-            only_english = self.config.get("watermark", {}).get("only_english", True)
+            only_english = wm_cfg.get("only_english", True)
 
-            mask = torch.tensor(_make_green_list_mask_numpy(
-                watermark_key=key[0],
-                fraction=key[1],
-                vocab_size=vocab_size,
-                model_emb_length=model_emb_length,
-                only_English=only_english,
-                tokenizer=self.tokenizer,
-            ), dtype=torch.float32)
+            if task == "green":
+                from gptwm import _make_green_list_mask_numpy
+                mask_np = _make_green_list_mask_numpy(
+                    watermark_key=key[1],
+                    fraction=key[2],
+                    vocab_size=vocab_size,
+                    model_emb_length=model_emb_length,
+                    only_English=only_english,
+                    tokenizer=self.tokenizer,
+                )
+            elif task == "initials":
+                from gptwm_initials import build_initials_mask_numpy
+                mask_np, _, _ = build_initials_mask_numpy(
+                    seed=key[1],
+                    vocab_size=vocab_size,
+                    model_emb_length=model_emb_length,
+                    tokenizer=self.tokenizer,
+                )
+            elif task == "neg":
+                import numpy as np
+                mask_np = np.zeros(model_emb_length, dtype=bool)
+            else:
+                raise ValueError(f"Unknown task: {task!r}")
+
+            mask = torch.tensor(mask_np, dtype=torch.float32)
             self._green_mask_cache[key] = mask.bool()
         return self._green_mask_cache[key]
 
@@ -186,11 +213,24 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
         self,
         wm_seeds: torch.Tensor,
         wm_fractions: torch.Tensor,
+        wm_tasks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Build a stacked (num_samples, V) bool mask tensor."""
+        """Build a stacked (num_samples, V) bool mask tensor.
+
+        If wm_tasks is None, falls back to config.watermark.mode (single-task,
+        backward compatible).
+        """
+        from recipe.watermark_kd_ray.dataset import ID_TO_TASK
+
+        if wm_tasks is None:
+            default_task = self.config.get("watermark", {}).get("mode", "green")
+            tasks_iter = [default_task] * len(wm_seeds)
+        else:
+            tasks_iter = [ID_TO_TASK[int(t)] for t in wm_tasks.tolist()]
+
         masks = []
-        for seed, frac in zip(wm_seeds.tolist(), wm_fractions.tolist()):
-            masks.append(self._get_green_mask(seed, frac))
+        for seed, frac, task in zip(wm_seeds.tolist(), wm_fractions.tolist(), tasks_iter):
+            masks.append(self._get_green_mask(seed, frac, task))
         return torch.stack(masks)  # (N, V)
 
     # ------------------------------------------------------------------ #
@@ -292,12 +332,17 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
             if english_vocab_mask is not None:
                 english_vocab_mask = english_vocab_mask.to(device)
 
+            # Per-sample task IDs (present when parquet has "task" column; else None)
+            task_ids_all = batch["task_id"].to(device) if "task_id" in batch.keys() else None
+
             if need_green_masks:
                 wm_seeds = batch["wm_seed"].to(device)               # (N,)
                 wm_fractions = batch["wm_fraction"].to(device)       # (N,)
 
                 # --- Build per-sample green masks (N, V) ---
-                green_masks = self._build_sample_green_masks(wm_seeds, wm_fractions).to(device)
+                green_masks = self._build_sample_green_masks(
+                    wm_seeds, wm_fractions, task_ids_all,
+                ).to(device)
             else:
                 green_masks = None
 
@@ -306,6 +351,21 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                 is_negative_all = batch["is_negative"].to(device).bool()  # (N,)
             else:
                 is_negative_all = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=device)
+
+            # Per-sample strength override (from watermark.task_strength config).
+            # Falls back to the global ``strength`` when task_strength or task_ids absent.
+            task_strength_cfg = self.config.get("watermark", {}).get("task_strength", None)
+            if task_ids_all is not None and task_strength_cfg is not None:
+                from recipe.watermark_kd_ray.dataset import ID_TO_TASK
+                per_sample_strengths = torch.zeros(task_ids_all.shape[0], device=device, dtype=torch.float32)
+                for i, tid in enumerate(task_ids_all.tolist()):
+                    tname = ID_TO_TASK[int(tid)]
+                    if tname == "neg":
+                        per_sample_strengths[i] = 0.0
+                    else:
+                        per_sample_strengths[i] = float(task_strength_cfg.get(tname, strength))
+            else:
+                per_sample_strengths = None  # single global strength used
 
             if need_ref_forward:
 
@@ -377,6 +437,9 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                 mb_green_masks = green_masks[s:e] if need_green_masks else None
                 mb_fractions = wm_fractions[s:e] if need_green_masks else None
                 mb_is_negative = is_negative_all[s:e]
+                mb_sample_strengths = (
+                    per_sample_strengths[s:e] if per_sample_strengths is not None else None
+                )
 
                 with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
                     if need_ref_forward:
@@ -444,6 +507,7 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                         sample_fractions=mb_fractions,
                         quality_green_topk=quality_green_topk,
                         sample_is_negative=mb_is_negative,
+                        sample_strengths=mb_sample_strengths,
                     )
 
                     loss.backward()

@@ -3,15 +3,15 @@ WatermarkKDDataset — dataset for watermark KD training.
 
 Reads pre-formatted chat-template strings from parquet and tokenizes:
   - Actor inputs  : config.prompt_column           (default "prompt")
-  - Ref inputs    : config.ref_prompt_column       (default "prompt_no_incontext_wm")
+  - Ref inputs    : config.ref_prompt_column       (default "prompt_ref")
 
-Both prompts are already apply_chat_template-formatted strings (produced by
-data_process/jsonl_to_parquet_file.py or v1_jsonl_to_parquet.py), so they are
+Both prompts are already apply_chat_template-formatted strings, so they are
 tokenized directly without a second chat-template application.
 
-For the offline KD pipeline the ref prompt column is the *clean* prompt
-(no incontext wm). For the V1 + privileged-GT paradigm it is the wm prompt
-+ GT example, set via dataset.ref_prompt_column=prompt_ref in the run script.
+``prompt_ref`` is per-sample and chosen by the parquet builder based on task:
+  - green pos : clean prompt (no ICW)      — biased teacher = clean_ref + bias
+  - neg       : clean prompt (no ICW)      — anchor to base distribution
+  - initials  : ICW prompt (identical to ``prompt``) — biased teacher = ICW_ref + bias
 
 Per-sample watermark seed/fraction are read from the "seed"/"fraction" columns.
 
@@ -27,6 +27,11 @@ from torch.utils.data import Dataset
 
 
 NEG_SENTINEL = -99999.0
+
+# Per-sample task types for mixed-task training. Task_id = index in TASK_NAMES.
+TASK_NAMES = ("green", "initials", "neg")
+TASK_TO_ID = {name: i for i, name in enumerate(TASK_NAMES)}
+ID_TO_TASK = {i: name for name, i in TASK_TO_ID.items()}
 
 
 class WatermarkKDDataset(Dataset):
@@ -56,7 +61,7 @@ class WatermarkKDDataset(Dataset):
         self.max_length = int(config.get("max_length", 8192))
         self.truncation = config.get("truncation", "right")
         prompt_column = config.get("prompt_column", "prompt")
-        ref_prompt_column = config.get("ref_prompt_column", "prompt_no_incontext_wm")
+        ref_prompt_column = config.get("ref_prompt_column", "prompt_ref")
 
         if isinstance(parquet_files, str):
             parquet_files = [parquet_files]
@@ -92,6 +97,22 @@ class WatermarkKDDataset(Dataset):
             self.is_negatives = (z_scores == NEG_SENTINEL).tolist()
         else:
             self.is_negatives = [False] * len(df)
+
+        # Per-sample task: read from "task" column if present; otherwise derive
+        # from is_negative + mode (backward compat: all pos→"green", all neg→"neg").
+        if "task" in df.columns:
+            tasks = df["task"].astype(str).tolist()
+        else:
+            fallback_pos = config.get("watermark_mode", config.get("mode", "green"))
+            tasks = [fallback_pos if not neg else "neg" for neg in self.is_negatives]
+        unknown = {t for t in tasks if t not in TASK_TO_ID}
+        if unknown:
+            raise ValueError(
+                f"Unknown task values in parquet: {unknown}. "
+                f"Allowed: {list(TASK_TO_ID.keys())}"
+            )
+        self.task_names = tasks
+        self.task_ids = [TASK_TO_ID[t] for t in tasks]
         n_neg = int(sum(self.is_negatives))
         print(
             f"WatermarkKDDataset: {len(df)} samples loaded "
@@ -181,4 +202,5 @@ class WatermarkKDDataset(Dataset):
             "wm_seed": torch.tensor(int(self.wm_seeds[item]), dtype=torch.long),
             "wm_fraction": torch.tensor(float(self.wm_fractions[item]), dtype=torch.float32),
             "is_negative": torch.tensor(bool(self.is_negatives[item]), dtype=torch.bool),
+            "task_id": torch.tensor(int(self.task_ids[item]), dtype=torch.long),
         }

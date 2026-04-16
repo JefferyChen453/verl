@@ -330,6 +330,8 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
         z_scores = []
         z_score_valid = []
         sample_labels = []  # "positive" or "negative" per sample
+        sample_tasks = []   # per-sample task name: "green"|"initials"|"neg"|"unknown"
+        per_task_z: dict = {}  # task_name -> list[float]; parallel to z_scores
         prompt_token_lengths = []
         padded_input_token_lengths = []
         response_token_lengths = []
@@ -367,6 +369,13 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
                 sample_labels.extend(str(lbl) for lbl in batch_labels)
             else:
                 sample_labels.extend(["unknown"] * len(test_batch.batch["input_ids"]))
+
+            # Per-task label (for mixed-val metric breakdown)
+            batch_tasks = test_batch.non_tensor_batch.get("task", None)
+            if batch_tasks is not None:
+                sample_tasks.extend(str(t) for t in batch_tasks)
+            else:
+                sample_tasks.extend(["unknown"] * len(test_batch.batch["input_ids"]))
 
             input_ids = test_batch.batch["input_ids"]
             attention_mask = test_batch.batch["attention_mask"]
@@ -465,6 +474,13 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
             z_scores.extend(float(score) for score in batch_z_scores)
             z_score_valid.extend(bool(flag) for flag in batch_valid)
 
+            # Collect per-detector z-scores when reward fn is mixed-mode
+            for key, arr in reward_extra_info.items():
+                if not key.startswith("z_score_") or key in ("z_score_valid",):
+                    continue
+                task_name = key[len("z_score_"):]
+                per_task_z.setdefault(task_name, []).extend(float(x) for x in arr)
+
             batch_total = perf_counter() - batch_start
             batch_total_times.append(batch_total)
             print(
@@ -558,6 +574,48 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
                 metric_dict["val/auc_roc"] = float(auc)
             except Exception as e:
                 print(f"Warning: could not compute AUC-ROC: {e}")
+
+        # --- Per-task metrics (mixed-val only) ---
+        # For each listed task ``T`` that has per-detector z scores collected in
+        # per_task_z[T], compute:
+        #   val/{T}_positive_z_score_mean : mean over samples with task==T & label==positive
+        #   val/{T}_negative_z_score_mean : mean over samples with label==negative using
+        #                                   detector T (neg samples detected by every detector)
+        #   val/{T}_auc_roc               : ROC of (task=T pos vs all neg) using detector T
+        tasks_arr = np.asarray(sample_tasks) if sample_tasks else None
+        if tasks_arr is not None and len(per_task_z) > 0 and len(tasks_arr) == total_count:
+            for task_name, z_list in per_task_z.items():
+                if len(z_list) != total_count:
+                    print(f"Warning: per-task z ({task_name}) length mismatch, skipping metric")
+                    continue
+                task_det_z = np.asarray(z_list, dtype=np.float64)
+
+                task_pos_mask = (tasks_arr == task_name) & (labels_arr == "positive") & valid_mask
+                all_neg_valid = neg_mask & valid_mask
+
+                if task_pos_mask.any():
+                    metric_dict[f"val/{task_name}_positive_z_score_mean"] = float(
+                        task_det_z[task_pos_mask].mean()
+                    )
+                if all_neg_valid.any():
+                    metric_dict[f"val/{task_name}_negative_z_score_mean"] = float(
+                        task_det_z[all_neg_valid].mean()
+                    )
+
+                if task_pos_mask.any() and all_neg_valid.any():
+                    try:
+                        from sklearn.metrics import roc_auc_score
+                        ys = np.concatenate([
+                            np.ones(int(task_pos_mask.sum())),
+                            np.zeros(int(all_neg_valid.sum())),
+                        ])
+                        xs = np.concatenate([
+                            task_det_z[task_pos_mask],
+                            task_det_z[all_neg_valid],
+                        ])
+                        metric_dict[f"val/{task_name}_auc_roc"] = float(roc_auc_score(ys, xs))
+                    except Exception as e:
+                        print(f"Warning: could not compute {task_name}_auc_roc: {e}")
 
         # N-gram repetition ratio (positive samples only)
         outputs_arr = np.asarray(sample_outputs, dtype=object)

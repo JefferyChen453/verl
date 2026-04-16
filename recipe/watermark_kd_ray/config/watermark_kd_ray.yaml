@@ -125,6 +125,11 @@ actor_rollout_ref:
 
 # ---- Watermark config ----
 watermark:
+  # Default per-sample task for back-compat parquets that don't have a "task"
+  # column (all pos → this; all neg → "neg"). Set per-sample "task" in parquet
+  # for mixed-task training.
+  mode: green
+  stats_file: data/initials_icw/leading_space_first_letter_stats.json  # initials γ lookup
   strength: 4.0
   only_english: true
   ce_loss_weight: 1.0
@@ -140,8 +145,21 @@ watermark:
   max_grad_norm: 1.0
   gradient_accumulation_steps: 1
 
-  eval_wm_seed: 1
-  eval_wm_fraction: 0.2
+  # Optional per-task strength override for biased-ref construction.
+  # NOT set by default — when absent, loss uses the global ``strength`` for
+  # every sample (preserves backward compat with old posneg scripts). Mixed
+  # training launchers should add via Hydra:
+  #   +watermark.task_strength.green=5.0 +watermark.task_strength.initials=3.0
+  # Neg samples always get strength=0 (no biased-ref forward).
+
+  # Validation detectors: the reward function instantiates one detector per
+  # task listed in eval_tasks and the trainer reports
+  #   val/{task}_positive_z_score_mean / val/{task}_negative_z_score_mean / val/{task}_auc_roc
+  # for each. For single-task runs, set eval_tasks to a one-element list.
+  eval_tasks: [green]                                # e.g. [green] | [initials] | [green, initials]
+  eval_green_seed: 0                                 # must match the seed baked into val parquet's green prompts
+  eval_green_fraction: 0.25                          # must match fraction baked into val parquet's green prompts
+  eval_initials_seed: 0                              # partition key for Initials val detector
 
 # ---- Data ----
 data:
