@@ -64,6 +64,7 @@ def compute_watermark_kd_loss(
     green_target_ratio: float = 0.0,
     sample_fractions: Optional[torch.Tensor] = None,
     quality_green_topk: int = 0,
+    distill_topk_biased_ref: int = 0,
     sample_is_negative: Optional[torch.Tensor] = None,
     sample_strengths: Optional[torch.Tensor] = None,
     sample_task_ids: Optional[torch.Tensor] = None,
@@ -93,6 +94,12 @@ def compute_watermark_kd_loss(
         english_vocab_mask:          (vocab_size,) bool — if provided, KL terms are computed over
                                      English tokens only (distributions renormalized over English
                                      sub-vocabulary). CE and L_green always use the full vocab.
+        distill_topk_biased_ref:     if > 0, biased-ref KL branches compute per-position top-K of
+                                     the biased teacher logits (ref + bias, restricted to
+                                     ``english_vocab_mask`` if provided) and do proper KL on that
+                                     subspace. Clean-ref and self-distill branches unaffected.
+                                     Top-K is taken on the biased teacher so bias-promoted green
+                                     tokens enter the KL support.
 
     Returns:
         (loss, metrics_dict)
@@ -200,9 +207,40 @@ def compute_watermark_kd_loss(
             if _need_sample_ref_i:
                 sample_ref = ref_logits[token_mask]
 
+            # Precompute per-position top-K on the BIASED teacher when
+            # distill_topk_biased_ref is enabled. Top-K is taken on (ref + bias)
+            # restricted to english if english_vocab_mask is provided.  We gather
+            # raw ref / actor logits at top-K positions and re-softmax on the
+            # K-subspace — proper KL on a per-position-selected vocabulary.
+            if distill_topk_biased_ref > 0 and (run_biased_ref or run_reverse_biased_ref):
+                _n_tok = sample_ref.shape[0]
+                _biased_full = sample_ref + green_bias  # (n, V) — green_bias broadcasts from (1, V)
+                if english_vocab_mask is not None:
+                    # Restrict top-K pool to english.  Non-english logits are set to
+                    # -inf so they rank last; but if K exceeds |english|, topk would
+                    # still pull non-english into the index set (their raw logits
+                    # would leak back when gathered below), polluting the support.
+                    # Cap K at the english-token count to avoid that.
+                    _biased_full = _biased_full.masked_fill(
+                        ~english_vocab_mask.unsqueeze(0), float("-inf")
+                    )
+                    _max_k = int(english_vocab_mask.sum().item())
+                else:
+                    _max_k = _biased_full.shape[-1]
+                _k = min(distill_topk_biased_ref, _max_k)
+                _brtopk_idx = _biased_full.topk(_k, dim=-1).indices  # (n, K)
+                # Gather raw ref + bias at top-K. green_bias is (1, V); expand to
+                # (n, V) as a view so gather's dim-0 matches the index shape.
+                _ref_gather = sample_ref.gather(-1, _brtopk_idx)                      # (n, K)
+                _bias_gather = green_bias.expand(_n_tok, -1).gather(-1, _brtopk_idx)  # (n, K)
+                _actor_gather = actor_logits[token_mask].gather(-1, _brtopk_idx)      # (n, K)
+
             # KL(D̂_ref ‖ D_actor)
             if run_biased_ref:
-                if english_vocab_mask is not None:
+                if distill_topk_biased_ref > 0:
+                    log_p = F.log_softmax(_ref_gather + _bias_gather, dim=-1)
+                    log_q = F.log_softmax(_actor_gather, dim=-1)
+                elif english_vocab_mask is not None:
                     log_p = F.log_softmax(sample_ref[:, english_vocab_mask] + green_bias_eng, dim=-1)
                     log_q = F.log_softmax(actor_logits_eng, dim=-1)
                 else:
@@ -214,7 +252,10 @@ def compute_watermark_kd_loss(
 
             # KL(D_actor ‖ D̂_ref)  — reverse biased ref
             if run_reverse_biased_ref:
-                if english_vocab_mask is not None:
+                if distill_topk_biased_ref > 0:
+                    log_p = F.log_softmax(_actor_gather, dim=-1)
+                    log_q = F.log_softmax(_ref_gather + _bias_gather, dim=-1)
+                elif english_vocab_mask is not None:
                     log_p = F.log_softmax(actor_logits_eng, dim=-1)
                     log_q = F.log_softmax(sample_ref[:, english_vocab_mask] + green_bias_eng, dim=-1)
                 else:

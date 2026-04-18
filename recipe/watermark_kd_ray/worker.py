@@ -276,6 +276,7 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
         grad_accum_steps             = int(wm_cfg.get("gradient_accumulation_steps", 1))
         green_target_ratio           = float(wm_cfg.get("green_target_ratio", 0.0))
         quality_green_topk           = int(wm_cfg.get("quality_green_topk", 0))
+        distill_topk_biased_ref      = int(wm_cfg.get("distill_topk_biased_ref", 0))
         # NOTE: kl_ref_actor / reverse_kl_ref_actor mathematically don't need
         # green masks for the loss term itself, but loss.py derives num_samples
         # from green_masks.shape[0] to drive the per-sample loop. Including these
@@ -507,6 +508,7 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                         green_target_ratio=green_target_ratio,
                         sample_fractions=mb_fractions,
                         quality_green_topk=quality_green_topk,
+                        distill_topk_biased_ref=distill_topk_biased_ref,
                         sample_is_negative=mb_is_negative,
                         sample_strengths=mb_sample_strengths,
                         sample_task_ids=mb_task_ids,
