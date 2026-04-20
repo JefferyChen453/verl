@@ -1,0 +1,109 @@
+"""WatermarkRLPromptDataset — prompt-only dataset for Stage 2 RL training.
+
+Parquet schema (see build_rl_train_parquet.py):
+    prompt, prompt_ref, prefix, seed, fraction, task, dataset_type
+
+Each __getitem__ returns a dict:
+    input_ids        (max_prompt_length,) long  — left-padded actor prompt ids
+    attention_mask   (max_prompt_length,) long
+    position_ids     (max_prompt_length,) long
+    raw_prompt_ids   list[int]                  — actor prompt ids for vLLM agent loop
+    raw_prompt       str                        — for logging
+    wm_seed          int                        — carries to reward fn
+    wm_fraction      float                      — carries to reward fn
+    task             str                        — {"green","initials","acrostics"}
+
+Collator packs torch.Tensor keys into DataProto.batch and str/list/scalar keys
+into DataProto.non_tensor_batch (object numpy arrays) via DataProto.from_single_dict.
+"""
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+
+class WatermarkRLPromptDataset(Dataset):
+    TENSOR_KEYS = ("input_ids", "attention_mask", "position_ids")
+    # Everything else is non-tensor (str / list / scalar)
+    NON_TENSOR_KEYS = ("raw_prompt_ids", "raw_prompt", "wm_seed", "wm_fraction", "task")
+
+    def __init__(self, parquet_files, tokenizer, config, max_samples: int = -1):
+        import pandas as pd
+        from verl.utils.fs import copy_to_local
+
+        self.tokenizer = tokenizer
+        self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        self.max_prompt_length = int(config.get("max_prompt_length", 65536))
+        prompt_column = config.get("prompt_column", "prompt")
+
+        if isinstance(parquet_files, str):
+            parquet_files = [parquet_files]
+
+        dfs = []
+        for pf in parquet_files:
+            local = copy_to_local(pf, verbose=True)
+            dfs.append(pd.read_parquet(local))
+        df = pd.concat(dfs, ignore_index=True)
+
+        total = len(df)
+        if max_samples > 0 and max_samples < total:
+            rng = np.random.default_rng(42)
+            idx = rng.choice(total, size=max_samples, replace=False)
+            df = df.iloc[idx.tolist()]
+            print(f"WatermarkRLPromptDataset: selected {max_samples} / {total} samples")
+        print(f"WatermarkRLPromptDataset: {len(df)} rows loaded, "
+              f"task breakdown: {df['task'].value_counts().to_dict()}")
+
+        self.prompts     = df[prompt_column].tolist()
+        self.wm_seeds    = df["seed"].tolist()
+        self.wm_fracs    = df["fraction"].tolist()
+        self.tasks       = df["task"].tolist()
+
+    def __len__(self):
+        return len(self.prompts)
+
+    def _tokenize(self, s: str) -> torch.Tensor:
+        ids = self.tokenizer(s, return_tensors="pt", add_special_tokens=False)["input_ids"][0]
+        if ids.shape[0] > self.max_prompt_length:
+            ids = ids[-self.max_prompt_length:]
+        return ids
+
+    def __getitem__(self, idx):
+        prompt_str = self.prompts[idx]
+        raw_ids = self._tokenize(prompt_str)
+        n = raw_ids.shape[0]
+        pad_len = self.max_prompt_length - n
+
+        if pad_len > 0:
+            pad = torch.full((pad_len,), self.pad_token_id, dtype=torch.long)
+            input_ids = torch.cat([pad, raw_ids])
+        else:
+            input_ids = raw_ids
+
+        attn = torch.zeros(self.max_prompt_length, dtype=torch.long)
+        attn[pad_len:] = 1
+        pos = torch.zeros(self.max_prompt_length, dtype=torch.long)
+        pos[pad_len:] = torch.arange(n, dtype=torch.long)
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attn,
+            "position_ids": pos,
+            "raw_prompt_ids": raw_ids.tolist(),
+            "raw_prompt": prompt_str,
+            "wm_seed": int(self.wm_seeds[idx]),
+            "wm_fraction": float(self.wm_fracs[idx]),
+            "task": str(self.tasks[idx]),
+        }
+
+
+class WatermarkRLPromptCollator:
+    """Collate a list of items into a dict DataProto.from_single_dict can parse."""
+
+    def __call__(self, items: list[dict]) -> dict:
+        out = {}
+        for k in WatermarkRLPromptDataset.TENSOR_KEYS:
+            out[k] = torch.stack([it[k] for it in items])
+        for k in WatermarkRLPromptDataset.NON_TENSOR_KEYS:
+            out[k] = np.array([it[k] for it in items], dtype=object)
+        return out
