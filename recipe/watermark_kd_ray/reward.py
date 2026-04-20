@@ -51,6 +51,14 @@ def _build_initials_detector(wm_seed, strength, tokenizer, model_config, stats_f
     )
 
 
+def _build_acrostics_detector(target, tokenizer, n_resample: int = 200, seed: int = 0):
+    from gptwm_acrostics import AcrosticsDetector
+    return AcrosticsDetector(
+        target=target, tokenizer=tokenizer,
+        n_resample=n_resample, seed=seed,
+    )
+
+
 class WatermarkZScoreRewardFn:
     """Reward function that computes watermark z-scores as rewards.
 
@@ -74,6 +82,8 @@ class WatermarkZScoreRewardFn:
         eval_green_seed: int = 1,
         eval_green_fraction: float = 0.25,
         eval_initials_seed: int = 0,
+        acrostics_target: str = "asdf",
+        acrostics_n_resample: int = 200,
     ):
         assert tokenizer is not None, "tokenizer must be provided"
         self.tokenizer = tokenizer
@@ -81,9 +91,9 @@ class WatermarkZScoreRewardFn:
         self.model_config = model_config
 
         self.eval_tasks = list(eval_tasks) if eval_tasks else ["green"]
-        unknown = [t for t in self.eval_tasks if t not in ("green", "initials")]
+        unknown = [t for t in self.eval_tasks if t not in ("green", "initials", "acrostics")]
         if unknown:
-            raise ValueError(f"eval_tasks must be subset of {{green, initials}}; got {unknown}")
+            raise ValueError(f"eval_tasks must be subset of {{green, initials, acrostics}}; got {unknown}")
 
         self.detectors: Dict[str, object] = {}
         if "green" in self.eval_tasks:
@@ -102,6 +112,12 @@ class WatermarkZScoreRewardFn:
                 tokenizer=tokenizer,
                 model_config=model_config,
                 stats_file=stats_file,
+            )
+        if "acrostics" in self.eval_tasks:
+            self.detectors["acrostics"] = _build_acrostics_detector(
+                target=acrostics_target,
+                tokenizer=tokenizer,
+                n_resample=acrostics_n_resample,
             )
         self.default_detector_key = self.eval_tasks[0]
         self.mode = "mixed" if len(self.eval_tasks) > 1 else self.eval_tasks[0]
