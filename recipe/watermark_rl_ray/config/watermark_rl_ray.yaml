@@ -126,7 +126,7 @@ reward:
   only_english: true
   stats_file: /home/tianyichen/llm_watermark/data/initials_icw/leading_space_first_letter_stats.json
   # Validation (fixed config) — z-score computed with these eval seeds across all val prompts
-  eval_green_seed: 1
+  eval_green_seed: 0
   eval_green_fraction: 0.25
   eval_initials_seed: 0
   acrostics_target: asdf

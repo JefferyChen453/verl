@@ -18,7 +18,7 @@ REPO_ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$REPO_ROOT"
 
 TS=$(date +%Y%m%d%H%M)
-EXP_NAME="rl_2task_green1000_initials1000_v5binit_grpo_${TS}"
+EXP_NAME="rl_2task_discard_v5binit_grpo_${TS}"
 
 CKPT_V5B="${REPO_ROOT}/checkpoints/watermark-kd-ray/v5b_green3379+initials865+neg1000_dualKL_biasedRefTopK1000_202604180857/global_step_655/hf_model"
 TRAIN_PARQUET="${REPO_ROOT}/data/rl_stage2/train_rl_green1000_initials1000.parquet"
@@ -34,13 +34,13 @@ python -m recipe.watermark_rl_ray.main \
   data.train_files="${TRAIN_PARQUET}" \
   data.val_files="${VAL_PARQUET}" \
   data.train_batch_size=4 \
-  actor_rollout_ref.actor.ppo_mini_batch_size=8 \
+  actor_rollout_ref.actor.ppo_mini_batch_size=16 \
   actor_rollout_ref.rollout.n=8 \
   trainer.project_name=watermark-rl-ray \
   trainer.experiment_name="${EXP_NAME}" \
   trainer.total_epochs=2 \
   trainer.save_freq=after_each_epoch \
   trainer.test_freq=30 \
-  trainer.val_before_train=false \
+  trainer.val_before_train=true \
   trainer.logger=["console","wandb"] \
   2>&1 | tee "logs/${EXP_NAME}.log"

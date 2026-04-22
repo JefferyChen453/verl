@@ -258,19 +258,65 @@ class WatermarkRLTrainer(WatermarkKDRayTrainer):
                 full_batch = full_batch.union(old_logp)
                 logp_s = perf_counter() - logp_start
 
-                # ---- Advantages (GRPO) ----
+                # ---- Advantages: valid-subset GRPO + invalid loss mask ----
+                # Only samples with z_score_valid=True participate in the group
+                # mean/std. Invalid samples (response too short) get advantage=0
+                # AND response_mask=0 so they contribute nothing to PG / entropy
+                # / KL loss aggregation. Reward value for invalid samples is
+                # therefore inert (the MIN_LEN sentinel never enters the loss).
                 full_batch.meta_info["global_token_num"] = torch.sum(
                     full_batch.batch["attention_mask"], dim=-1
                 ).tolist()
 
-                full_batch = compute_advantage(
-                    full_batch,
-                    adv_estimator=adv_estimator,
-                    gamma=self.config.algorithm.gamma,
-                    lam=self.config.algorithm.lam,
-                    num_repeat=n,
-                    norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                )
+                valid_np = full_batch.non_tensor_batch["z_score_valid"].astype(bool)
+                uids_np  = full_batch.non_tensor_batch["uid"]
+                scores   = full_batch.batch["token_level_rewards"].sum(dim=-1)
+                device   = scores.device
+
+                advantages_scalar = torch.zeros_like(scores)
+                valid_t = torch.from_numpy(valid_np).to(device)
+
+                group_all_invalid = 0
+                group_partial_invalid = 0
+                group_singleton_valid = 0
+                unique_uids = np.unique(uids_np)
+                for uid in unique_uids:
+                    g_mask_np  = (uids_np == uid)
+                    g_valid_np = g_mask_np & valid_np
+                    n_valid = int(g_valid_np.sum())
+                    n_total = int(g_mask_np.sum())
+
+                    if n_valid == 0:
+                        group_all_invalid += 1
+                        continue
+                    if n_valid < n_total:
+                        group_partial_invalid += 1
+                    if n_valid < 2:
+                        group_singleton_valid += 1
+                        continue  # no within-group signal; advantage stays 0
+
+                    g_valid_t = torch.from_numpy(g_valid_np).to(device)
+                    s = scores[g_valid_t]
+                    mean_g = s.mean()
+                    if norm_adv_by_std_in_grpo:
+                        std_g = s.std(unbiased=False) + 1e-6
+                        advantages_scalar[g_valid_t] = (s - mean_g) / std_g
+                    else:
+                        advantages_scalar[g_valid_t] = s - mean_g
+
+                adv_tok = advantages_scalar.unsqueeze(-1) * full_batch.batch["response_mask"]
+                full_batch.batch["advantages"] = adv_tok
+                full_batch.batch["returns"]    = adv_tok
+
+                invalid_t = ~valid_t
+                full_batch.batch["response_mask"][invalid_t] = 0
+
+                metrics["reward/n_valid"] = int(valid_np.sum())
+                metrics["reward/n_total"] = int(valid_np.size)
+                metrics["reward/group_count"] = int(len(unique_uids))
+                metrics["reward/group_all_invalid"] = group_all_invalid
+                metrics["reward/group_partial_invalid"] = group_partial_invalid
+                metrics["reward/group_singleton_valid"] = group_singleton_valid
 
                 # ---- Update actor ----
                 update_start = perf_counter()
