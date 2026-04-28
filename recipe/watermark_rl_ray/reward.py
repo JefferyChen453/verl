@@ -1,26 +1,21 @@
 """Per-sample watermark z-score reward function for Stage 2 RL training.
 
-Each sample carries its own (task, wm_seed, wm_fraction). We build a detector
-per (task, seed, fraction) on demand, cache it, and compute z-score on the
+Each sample carries its own (task, wm_seed, wm_fraction). For task=='acrostics',
+the sample additionally carries its own ``acrostic_target`` (per-sample target
+string) — this is critical so the model learns *generalizable* acrostic skill
+instead of memorizing one fixed target. We build a detector per
+(task, seed, fraction, target) on demand, cache it, and compute z-score on the
 rollout response tokens. The scalar z is placed at the last response position
 (token-level reward convention in verl/DAPO).
 
 Input (DataProto):
-  data.batch["responses"]            (B, T)  long  — rollout response tokens
-  data.non_tensor_batch["task"]      (B,)    object — per-sample task label
-  data.non_tensor_batch["wm_seed"]   (B,)    object — per-sample seed
-  data.non_tensor_batch["wm_fraction"] (B,)  object — per-sample fraction/gamma
-
-Output:
-  {
-      "reward_tensor": torch.Tensor  (B, T) with z-score at last response position,
-      "reward_extra_info": {
-          "z_score":           list[float],  # per-sample scalar z (routed)
-          "z_score_valid":     list[bool],   # False if response too short
-          "z_score_{task}":    list[float],  # per-task detector z (NaN on task mismatch)
-          "response_len":      list[int],
-      }
-  }
+  data.batch["responses"]                 (B, T)  long  — rollout response tokens
+  data.non_tensor_batch["task"]           (B,)    object — per-sample task label
+  data.non_tensor_batch["wm_seed"]        (B,)    object — per-sample seed
+  data.non_tensor_batch["wm_fraction"]    (B,)    object — per-sample fraction/gamma
+  data.non_tensor_batch["acrostic_target"] (B,)   object — per-sample target string
+                                                            (only set when task=='acrostics';
+                                                            falls back to config default)
 """
 
 from __future__ import annotations
@@ -79,9 +74,18 @@ class PerSampleWatermarkZScoreRewardFn:
         # Detector cache: {(task, seed, frac_key): detector}
         self._cache: Dict[tuple, object] = {}
 
-    def _get_detector(self, task: str, seed: int, fraction: float):
+    def _get_detector(self, task: str, seed: int, fraction: float, target: str = None):
+        """Build (and cache) a detector for a single (task, seed, fraction, target) tuple.
+
+        ``target`` is only used when ``task=='acrostics'``; for other tasks it is ignored
+        in the cache key.
+        """
         frac_key = _round_frac(fraction)
-        key = (task, int(seed), frac_key)
+        if task == "acrostics":
+            t = target if target else self.acrostics_target
+            key = (task, t)        # acrostics detector keyed on target only
+        else:
+            key = (task, int(seed), frac_key)
         if key in self._cache:
             return self._cache[key]
 
@@ -112,10 +116,12 @@ class PerSampleWatermarkZScoreRewardFn:
             )
         elif task == "acrostics":
             from gptwm_acrostics import AcrosticsDetector
+            t = target if target else self.acrostics_target
             det = AcrosticsDetector(
-                target=self.acrostics_target,
+                target=t,
                 tokenizer=self.tokenizer,
                 n_resample=self.acrostics_n_resample,
+                strict=True,   # strict mode blocks heading/list reward-hack
             )
         else:
             raise ValueError(f"unknown task {task!r}")
@@ -131,6 +137,7 @@ class PerSampleWatermarkZScoreRewardFn:
         tasks       = data.non_tensor_batch["task"]
         wm_seeds    = data.non_tensor_batch["wm_seed"]
         wm_fracs    = data.non_tensor_batch["wm_fraction"]
+        acr_targets = data.non_tensor_batch.get("acrostic_target", [None] * B)
 
         z_scores: list = []
         z_valid:  list = []
@@ -141,6 +148,8 @@ class PerSampleWatermarkZScoreRewardFn:
             task = str(tasks[i])
             seed = int(wm_seeds[i])
             frac = float(wm_fracs[i])
+            target = acr_targets[i] if i < len(acr_targets) else None
+            target = str(target) if target and str(target) != "None" else None
 
             ids = responses[i].tolist()
             token_list = [t for t in ids if t != self.pad_token_id]
@@ -156,10 +165,10 @@ class PerSampleWatermarkZScoreRewardFn:
 
             # Per-task z (fill only the one matching this sample's task)
             try:
-                det = self._get_detector(task, seed, frac)
+                det = self._get_detector(task, seed, frac, target=target)
                 z = float(det.unidetect(token_list))
             except Exception as e:
-                print(f"[reward] detector error task={task} seed={seed} frac={frac}: {e}")
+                print(f"[reward] detector error task={task} seed={seed} frac={frac} target={target}: {e}")
                 z = 0.0
 
             z_scores.append(z)

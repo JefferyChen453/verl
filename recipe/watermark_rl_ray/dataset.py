@@ -1,7 +1,8 @@
 """WatermarkRLPromptDataset — prompt-only dataset for Stage 2 RL training.
 
-Parquet schema (see build_rl_train_parquet.py):
-    prompt, prompt_ref, prefix, seed, fraction, task, dataset_type
+Parquet schema (3-task; see build_train_parquet_3task.py):
+    prompt, prompt_ref, prefix, seed, fraction, task, dataset_type,
+    acrostic_target  (str | None — only set when task=='acrostics')
 
 Each __getitem__ returns a dict:
     input_ids        (max_prompt_length,) long  — left-padded actor prompt ids
@@ -12,6 +13,7 @@ Each __getitem__ returns a dict:
     wm_seed          int                        — carries to reward fn
     wm_fraction      float                      — carries to reward fn
     task             str                        — {"green","initials","acrostics"}
+    acrostic_target  str                        — per-sample target ("" for non-acrostics)
 
 Collator packs torch.Tensor keys into DataProto.batch and str/list/scalar keys
 into DataProto.non_tensor_batch (object numpy arrays) via DataProto.from_single_dict.
@@ -25,7 +27,7 @@ from torch.utils.data import Dataset
 class WatermarkRLPromptDataset(Dataset):
     TENSOR_KEYS = ("input_ids", "attention_mask", "position_ids")
     # Everything else is non-tensor (str / list / scalar)
-    NON_TENSOR_KEYS = ("raw_prompt_ids", "raw_prompt", "wm_seed", "wm_fraction", "task")
+    NON_TENSOR_KEYS = ("raw_prompt_ids", "raw_prompt", "wm_seed", "wm_fraction", "task", "acrostic_target")
 
     def __init__(self, parquet_files, tokenizer, config, max_samples: int = -1):
         import pandas as pd
@@ -58,6 +60,11 @@ class WatermarkRLPromptDataset(Dataset):
         self.wm_seeds    = df["seed"].tolist()
         self.wm_fracs    = df["fraction"].tolist()
         self.tasks       = df["task"].tolist()
+        # acrostic_target column may not exist for legacy 2-task parquets
+        if "acrostic_target" in df.columns:
+            self.acrostic_targets = df["acrostic_target"].fillna("").astype(str).tolist()
+        else:
+            self.acrostic_targets = [""] * len(df)
 
     def __len__(self):
         return len(self.prompts)
@@ -94,6 +101,7 @@ class WatermarkRLPromptDataset(Dataset):
             "wm_seed": int(self.wm_seeds[idx]),
             "wm_fraction": float(self.wm_fracs[idx]),
             "task": str(self.tasks[idx]),
+            "acrostic_target": str(self.acrostic_targets[idx]) if self.acrostic_targets[idx] else "",
         }
 
 
