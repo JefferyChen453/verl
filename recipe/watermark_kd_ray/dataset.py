@@ -29,7 +29,7 @@ from torch.utils.data import Dataset
 NEG_SENTINEL = -99999.0
 
 # Per-sample task types for mixed-task training. Task_id = index in TASK_NAMES.
-TASK_NAMES = ("green", "initials", "neg")
+TASK_NAMES = ("green", "initials", "neg", "acrostics")
 TASK_TO_ID = {name: i for i, name in enumerate(TASK_NAMES)}
 ID_TO_TASK = {i: name for name, i in TASK_TO_ID.items()}
 
@@ -50,6 +50,20 @@ class WatermarkKDDataset(Dataset):
         wm_seed             ()          long
         wm_fraction         ()          float
         is_negative         ()          bool  — True if this is a negative (clean) sample
+
+        # Acrostic-only fields (zero/all-(-1) for non-acrostic samples):
+        acrostic_bias_letter_idx_actor (L_actor,)  long — letter idx (-1=no bias,
+                                                          0..25 = a..z) at each
+                                                          actor position. After
+                                                          worker's [:, 1:] shift,
+                                                          slot at actor position
+                                                          (P+n) → predicting
+                                                          response[n] aligns with
+                                                          flat position P-1+n.
+        acrostic_bias_letter_idx_ref  (L_ref,)     long — same, for ref input
+                                                          length (which differs
+                                                          from L_actor since
+                                                          prompt_ref is clean).
     """
 
     def __init__(self, parquet_files, tokenizer, config, max_samples: int = -1):
@@ -91,6 +105,19 @@ class WatermarkKDDataset(Dataset):
         self.responses = df["response"].tolist()
         self.wm_seeds = df["seed"].tolist()
         self.wm_fractions = df["fraction"].tolist()
+
+        # Acrostic per-sample artifacts. ``acrostic_bias_letter_idx_response``
+        # is the per-RESPONSE-token letter idx list pre-computed at parquet
+        # build time (None / NaN for non-acrostic rows). At __getitem__ time we
+        # lift it to (L_actor,) by placing entries at offsets [P, P+R-1].
+        if "acrostic_bias_letter_idx_response" in df.columns:
+            self.acrostic_bias_idx_response = df["acrostic_bias_letter_idx_response"].tolist()
+        else:
+            self.acrostic_bias_idx_response = [None] * len(df)
+        if "acrostic_target" in df.columns:
+            self.acrostic_targets = df["acrostic_target"].tolist()
+        else:
+            self.acrostic_targets = [None] * len(df)
 
         if "z_score" in df.columns:
             z_scores = df["z_score"].to_numpy()
@@ -176,18 +203,92 @@ class WatermarkKDDataset(Dataset):
             loss_mask[: min(prompt_length, seq_len) - 1] = 0.0
         loss_mask[min(prompt_length + response_length, seq_len) - 1] = 0.0
 
-        return input_ids, attention_mask, position_ids, loss_mask
+        return input_ids, attention_mask, position_ids, loss_mask, prompt_length, response_length
+
+    def _build_acrostic_bias_idx_tensor(
+        self,
+        per_step_bias_idx,
+        prompt_length: int,
+        response_length: int,
+        seq_len: int,
+        truncation_side: str,
+    ) -> torch.Tensor:
+        """Lift the per-response-step letter-idx list to a (seq_len,) tensor at
+        offsets [P, P+R-1]. Returns all-(-1) tensor for non-acrostic samples
+        (per_step_bias_idx None / empty).
+
+        ``truncation_side`` tells us how the input_ids tensor was truncated
+        (when prompt_length + response_length > max_length); we mirror that
+        truncation so positions still match.
+        """
+        arr = torch.full((seq_len,), -1, dtype=torch.long)
+        if per_step_bias_idx is None:
+            return arr
+        # Tolerate pyarrow-deserialized list-likes (numpy / pandas).
+        try:
+            n_steps = len(per_step_bias_idx)
+        except TypeError:
+            return arr
+        if n_steps == 0:
+            return arr
+
+        # Untruncated layout: positions [0..P-1] = prompt, [P..P+R-1] = response.
+        # If truncation_side == "left" and (P+R) > max_length, the head was
+        # dropped, so the response shifts left by (P+R - max_length).
+        # If "right", the tail was dropped — response may be partially clipped.
+        full_len = prompt_length + response_length
+        step_offset = 0
+        if full_len <= seq_len:
+            # No truncation
+            response_start = prompt_length
+            n_kept = response_length
+        elif truncation_side == "left":
+            drop = full_len - seq_len
+            response_start = max(0, prompt_length - drop)
+            # If drop > prompt_length, the head ate (drop - P) response steps.
+            step_offset = max(0, drop - prompt_length)
+            n_kept = response_length - step_offset
+        else:  # right
+            response_start = prompt_length
+            n_kept = max(0, seq_len - prompt_length)
+            n_kept = min(n_kept, response_length)
+
+        # Place per_step_bias_idx[step_offset : step_offset + n_kept] into
+        # arr[response_start : response_start + n_kept].
+        for i in range(n_kept):
+            src = step_offset + i
+            dst = response_start + i
+            if 0 <= dst < seq_len and 0 <= src < n_steps:
+                v = int(per_step_bias_idx[src])
+                arr[dst] = v
+        return arr
 
     def __getitem__(self, item):
         prompt = self.prompts[item]
         prompt_ref = self.prompts_ref[item]
         response = self.responses[item]
 
-        input_ids, attention_mask, position_ids, loss_mask = self._tokenize_sequence(
+        input_ids, attention_mask, position_ids, loss_mask, P_actor, R_actor = self._tokenize_sequence(
             prompt, response
         )
-        input_ids_ref, attention_mask_ref, position_ids_ref, loss_mask_ref = self._tokenize_sequence(
+        input_ids_ref, attention_mask_ref, position_ids_ref, loss_mask_ref, P_ref, R_ref = self._tokenize_sequence(
             prompt_ref, response
+        )
+
+        per_step = self.acrostic_bias_idx_response[item]
+        bias_idx_actor = self._build_acrostic_bias_idx_tensor(
+            per_step_bias_idx=per_step,
+            prompt_length=P_actor,
+            response_length=R_actor,
+            seq_len=int(input_ids.shape[0]),
+            truncation_side=self.truncation,
+        )
+        bias_idx_ref = self._build_acrostic_bias_idx_tensor(
+            per_step_bias_idx=per_step,
+            prompt_length=P_ref,
+            response_length=R_ref,
+            seq_len=int(input_ids_ref.shape[0]),
+            truncation_side=self.truncation,
         )
 
         return {
@@ -203,4 +304,6 @@ class WatermarkKDDataset(Dataset):
             "wm_fraction": torch.tensor(float(self.wm_fractions[item]), dtype=torch.float32),
             "is_negative": torch.tensor(bool(self.is_negatives[item]), dtype=torch.bool),
             "task_id": torch.tensor(int(self.task_ids[item]), dtype=torch.long),
+            "acrostic_bias_letter_idx_actor": bias_idx_actor,
+            "acrostic_bias_letter_idx_ref": bias_idx_ref,
         }

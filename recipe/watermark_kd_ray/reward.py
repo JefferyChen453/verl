@@ -51,9 +51,43 @@ def _build_initials_detector(wm_seed, strength, tokenizer, model_config, stats_f
     )
 
 
+class _HitsZAcrosticDetector:
+    """Adapter wrapping ``acrostics_zstat.compute_hits_zstat`` with a
+    ``unidetect(token_list) -> float`` API for the reward fn.
+
+    Uses the markdown-aware extractor + controller-walk hit count + shuffle-S
+    permutation null (hits-z, the production detector as of 2026-04-29).
+    """
+
+    def __init__(self, target: str, tokenizer, n_resample: int = 200,
+                 seed: int = 0, max_fail_streak: int = 3):
+        assert tokenizer is not None
+        assert isinstance(target, str) and len(target) > 0
+        self.target = target
+        self.tokenizer = tokenizer
+        self.n_resample = int(n_resample)
+        self.seed = int(seed)
+        self.max_fail_streak = int(max_fail_streak)
+
+    def _decode(self, token_list):
+        return self.tokenizer.decode(token_list, skip_special_tokens=True)
+
+    def detect(self, token_list):
+        from acrostics_zstat import compute_hits_zstat
+        text = self._decode(token_list)
+        stat = compute_hits_zstat(
+            text=text, target=self.target, extractor="md",
+            n_resample=self.n_resample, seed=self.seed,
+            max_fail_streak=self.max_fail_streak,
+        )
+        return float(stat.z)
+
+    def unidetect(self, token_list):
+        return self.detect(token_list)
+
+
 def _build_acrostics_detector(target, tokenizer, n_resample: int = 200, seed: int = 0):
-    from gptwm_acrostics import AcrosticsDetector
-    return AcrosticsDetector(
+    return _HitsZAcrosticDetector(
         target=target, tokenizer=tokenizer,
         n_resample=n_resample, seed=seed,
     )

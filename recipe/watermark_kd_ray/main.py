@@ -128,6 +128,21 @@ class TaskRunner:
         # ---- Val reward function (z-score) ----
         from recipe.watermark_kd_ray.reward import WatermarkZScoreRewardFn
 
+        # Build acrostics target from seed+length if config provides them and
+        # the explicit string isn't set (mirrors how green/initials use seeds).
+        acrostics_target = config.watermark.get("acrostics_target", None)
+        if acrostics_target is None:
+            acr_seed = int(config.watermark.get("eval_acrostic_seed", 0))
+            acr_len = int(config.watermark.get("eval_acrostic_length", 18))
+            try:
+                from acrostics_icw import sample_target_icw, ICW_LETTER_POOL
+                acrostics_target = sample_target_icw(
+                    seed=acr_seed, length=acr_len, pool=ICW_LETTER_POOL,
+                    uppercase=True,
+                )
+            except ImportError:
+                acrostics_target = "asdf"  # fallback default
+
         val_reward_fn = WatermarkZScoreRewardFn(
             tokenizer=tokenizer,
             model_config=model_config,
@@ -141,6 +156,8 @@ class TaskRunner:
             eval_green_seed=config.watermark.get("eval_green_seed", 1),
             eval_green_fraction=config.watermark.get("eval_green_fraction", 0.25),
             eval_initials_seed=config.watermark.get("eval_initials_seed", 0),
+            acrostics_target=acrostics_target,
+            acrostics_n_resample=config.watermark.get("acrostics_n_resample", 200),
         )
 
         # ---- Trainer ----
@@ -215,8 +232,14 @@ class WatermarkKDCollator:
     """
 
     # Actor and ref sequences padded independently (may differ in max length)
-    SEQ_KEYS = ("input_ids", "loss_mask", "attention_mask", "position_ids")
-    SEQ_KEYS_REF = ("input_ids_ref", "loss_mask_ref", "attention_mask_ref", "position_ids_ref")
+    SEQ_KEYS = (
+        "input_ids", "loss_mask", "attention_mask", "position_ids",
+        "acrostic_bias_letter_idx_actor",
+    )
+    SEQ_KEYS_REF = (
+        "input_ids_ref", "loss_mask_ref", "attention_mask_ref", "position_ids_ref",
+        "acrostic_bias_letter_idx_ref",
+    )
     SCALAR_KEYS = ("wm_seed", "wm_fraction", "is_negative", "task_id")
     PAD_VALUES = {
         "input_ids": None,      # uses pad_token_id
@@ -227,6 +250,8 @@ class WatermarkKDCollator:
         "loss_mask_ref": 0,
         "attention_mask_ref": 0,
         "position_ids_ref": 0,
+        "acrostic_bias_letter_idx_actor": -1,
+        "acrostic_bias_letter_idx_ref":   -1,
     }
 
     def __init__(self, pad_token_id: int = 0, max_length: int = 4096):

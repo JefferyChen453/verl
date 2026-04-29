@@ -68,6 +68,12 @@ def compute_watermark_kd_loss(
     sample_is_negative: Optional[torch.Tensor] = None,
     sample_strengths: Optional[torch.Tensor] = None,
     sample_task_ids: Optional[torch.Tensor] = None,
+    acrostic_bias_letter_idx: Optional[torch.Tensor] = None,
+    acrostic_letter_bucket_masks: Optional[torch.Tensor] = None,
+    loss_normalization_mode: str = "global",
+    batch_num_pos_nonacr_tokens: Optional[float] = None,
+    batch_num_neg_tokens: Optional[float] = None,
+    batch_num_acr_active_tokens: Optional[float] = None,
 ):
     """
     Compute combined watermark KD loss on response-only flattened tensors.
@@ -94,6 +100,18 @@ def compute_watermark_kd_loss(
         english_vocab_mask:          (vocab_size,) bool — if provided, KL terms are computed over
                                      English tokens only (distributions renormalized over English
                                      sub-vocabulary). CE and L_green always use the full vocab.
+        loss_normalization_mode:     "global" (legacy default) or "per_task". In "global" all
+                                     terms divide by ``batch_num_tokens``. In "per_task" each
+                                     term divides by its applicable token count:
+                                       - L_green / pos-non-acr biased KL / self-distill →
+                                         ``batch_num_pos_nonacr_tokens``
+                                       - acrostic biased KL → ``batch_num_acr_active_tokens``
+                                       - clean-ref KL (neg) → ``batch_num_neg_tokens``
+                                       - L_CE → still ``batch_num_tokens`` (every response token)
+        batch_num_pos_nonacr_tokens, batch_num_neg_tokens, batch_num_acr_active_tokens:
+                                     per-task token totals, all-reduced across DP ranks. Required
+                                     when loss_normalization_mode="per_task". Pass any value in
+                                     "global" mode (ignored).
         distill_topk_biased_ref:     if > 0, biased-ref KL branches compute per-position top-K of
                                      the biased teacher logits (ref + bias, restricted to
                                      ``english_vocab_mask`` if provided) and do proper KL on that
@@ -140,9 +158,13 @@ def compute_watermark_kd_loss(
                 green_targets = (sample_fractions.float() * green_target_ratio).clamp(max=1.0 - 1e-8)
                 green_target_log = torch.log(green_targets)  # (num_samples,)
         if need_kl_biased_ref:
-            l_kl_biased_ref_total = torch.zeros(1, device=actor_logits.device, dtype=actor_logits.dtype)
+            # Split into pos-non-acr (green/initials) and acrostic accumulators so
+            # per-task normalization mode can divide by their respective denominators.
+            l_kl_biased_ref_pos_total = torch.zeros(1, device=actor_logits.device, dtype=actor_logits.dtype)
+            l_kl_biased_ref_acr_total = torch.zeros(1, device=actor_logits.device, dtype=actor_logits.dtype)
         if need_reverse_kl_biased_ref:
-            l_kl_biased_ref_rev_total = torch.zeros(1, device=actor_logits.device, dtype=actor_logits.dtype)
+            l_kl_biased_ref_rev_pos_total = torch.zeros(1, device=actor_logits.device, dtype=actor_logits.dtype)
+            l_kl_biased_ref_rev_acr_total = torch.zeros(1, device=actor_logits.device, dtype=actor_logits.dtype)
         if need_kl_ref:
             l_kl_ref_total = torch.zeros(1, device=actor_logits.device, dtype=actor_logits.dtype)
         if need_reverse_kl_ref:
@@ -154,22 +176,40 @@ def compute_watermark_kd_loss(
 
         need_green_bias = need_kl_biased_ref or need_reverse_kl_biased_ref or need_kl_biased_actor or need_reverse_kl_biased_actor
 
+        # Task IDs: 0=green, 1=initials, 2=neg, 3=acrostic (matches dataset.TASK_NAMES)
+        TASK_ID_ACROSTIC = 3
+
         for i in range(num_samples):
             token_mask = sample_index == i
             if token_mask.sum() == 0:
                 continue
 
-            # Per-sample pos/neg routing
+            # Per-sample pos/neg/acrostic routing
             is_neg_i = sample_is_negative is not None and bool(sample_is_negative[i])
-            # Pos-only: biased_ref KL (fwd/rev), green loss, biased self-distill
-            run_biased_ref = need_kl_biased_ref and not is_neg_i
-            run_reverse_biased_ref = need_reverse_kl_biased_ref and not is_neg_i
-            run_green = need_green and not is_neg_i
-            run_kl_biased_actor = need_kl_biased_actor and not is_neg_i
-            run_reverse_kl_biased_actor = need_reverse_kl_biased_actor and not is_neg_i
+            is_acrostic_i = (
+                sample_task_ids is not None
+                and int(sample_task_ids[i].item()) == TASK_ID_ACROSTIC
+            )
+            # Pos-only (NON-acrostic): biased_ref KL (fwd/rev), green loss, biased self-distill
+            run_biased_ref = need_kl_biased_ref and not is_neg_i and not is_acrostic_i
+            run_reverse_biased_ref = need_reverse_kl_biased_ref and not is_neg_i and not is_acrostic_i
+            run_green = need_green and not is_neg_i and not is_acrostic_i
+            run_kl_biased_actor = need_kl_biased_actor and not is_neg_i and not is_acrostic_i
+            run_reverse_kl_biased_actor = need_reverse_kl_biased_actor and not is_neg_i and not is_acrostic_i
             # Neg-only: clean ref KL (fwd/rev)
             run_kl_ref = need_kl_ref and is_neg_i
             run_reverse_kl_ref = need_reverse_kl_ref and is_neg_i
+            # Acrostic-only: per-position biased KL at sentence-start positions
+            run_acrostic_biased_ref = (
+                need_kl_biased_ref and is_acrostic_i
+                and acrostic_bias_letter_idx is not None
+                and acrostic_letter_bucket_masks is not None
+            )
+            run_acrostic_reverse_biased_ref = (
+                need_reverse_kl_biased_ref and is_acrostic_i
+                and acrostic_bias_letter_idx is not None
+                and acrostic_letter_bucket_masks is not None
+            )
 
             # Shared indexing per sample
             sample_log_q = log_probs_all[token_mask]  # (n_tokens, V)
@@ -235,7 +275,7 @@ def compute_watermark_kd_loss(
                 _bias_gather = green_bias.expand(_n_tok, -1).gather(-1, _brtopk_idx)  # (n, K)
                 _actor_gather = actor_logits[token_mask].gather(-1, _brtopk_idx)      # (n, K)
 
-            # KL(D̂_ref ‖ D_actor)
+            # KL(D̂_ref ‖ D_actor) — pos-non-acrostic (green / initials) bucket
             if run_biased_ref:
                 if distill_topk_biased_ref > 0:
                     log_p = F.log_softmax(_ref_gather + _bias_gather, dim=-1)
@@ -248,9 +288,9 @@ def compute_watermark_kd_loss(
                     log_q = sample_log_q
                 p = log_p.exp()
                 kl_per_token = torch.sum(p * (log_p - log_q), dim=-1)
-                l_kl_biased_ref_total = l_kl_biased_ref_total + kl_per_token.sum()
+                l_kl_biased_ref_pos_total = l_kl_biased_ref_pos_total + kl_per_token.sum()
 
-            # KL(D_actor ‖ D̂_ref)  — reverse biased ref
+            # KL(D_actor ‖ D̂_ref)  — reverse biased ref, pos-non-acrostic bucket
             if run_reverse_biased_ref:
                 if distill_topk_biased_ref > 0:
                     log_p = F.log_softmax(_actor_gather, dim=-1)
@@ -263,7 +303,7 @@ def compute_watermark_kd_loss(
                     log_q = F.log_softmax(sample_ref + green_bias, dim=-1)
                 p = log_p.exp()
                 kl_per_token = torch.sum(p * (log_p - log_q), dim=-1)
-                l_kl_biased_ref_rev_total = l_kl_biased_ref_rev_total + kl_per_token.sum()
+                l_kl_biased_ref_rev_pos_total = l_kl_biased_ref_rev_pos_total + kl_per_token.sum()
 
             # KL(D_ref ‖ D_actor) — forward quality anchor (neg samples only)
             if run_kl_ref:
@@ -340,39 +380,140 @@ def compute_watermark_kd_loss(
                 kl_per_token = torch.sum(p * (log_p - log_q), dim=-1)
                 l_kl_ba_rev_total = l_kl_ba_rev_total + kl_per_token.sum()
 
-        # Reduce and accumulate
+            # ---- Acrostic per-position biased KL (sentence-start positions only) ----
+            # Bias is per-token: at active positions (acrostic_bias_letter_idx >= 0),
+            # bias = strength * letter_bucket_mask[letter_idx]. KL is computed only
+            # at active positions. Top-K and english_vocab_mask are applied the
+            # same way as the green/initials biased path for consistency.
+            if run_acrostic_biased_ref or run_acrostic_reverse_biased_ref:
+                acro_bias_idx_i = acrostic_bias_letter_idx[token_mask]   # (n_tokens,)
+                active_mask_i = acro_bias_idx_i >= 0
+                if int(active_mask_i.sum().item()) > 0:
+                    s_i = (
+                        float(sample_strengths[i].item())
+                        if sample_strengths is not None
+                        else strength
+                    )
+                    # Active position slices
+                    sample_actor_active = actor_logits[token_mask][active_mask_i]      # (n_act, V)
+                    sample_ref_active = ref_logits[token_mask][active_mask_i]          # (n_act, V)
+                    active_letter_idx = acro_bias_idx_i[active_mask_i].long()          # (n_act,)
+                    active_bias_full = (
+                        s_i
+                        * acrostic_letter_bucket_masks[active_letter_idx].to(
+                            sample_actor_active.dtype
+                        )
+                    )                                                                  # (n_act, V)
+                    n_act = sample_actor_active.shape[0]
+
+                    if distill_topk_biased_ref > 0:
+                        biased_full = sample_ref_active + active_bias_full
+                        if english_vocab_mask is not None:
+                            biased_full = biased_full.masked_fill(
+                                ~english_vocab_mask.unsqueeze(0), float("-inf")
+                            )
+                            max_k = int(english_vocab_mask.sum().item())
+                        else:
+                            max_k = biased_full.shape[-1]
+                        k = min(distill_topk_biased_ref, max_k)
+                        topk_idx = biased_full.topk(k, dim=-1).indices                # (n_act, K)
+                        ref_g = sample_ref_active.gather(-1, topk_idx)
+                        bias_g = active_bias_full.gather(-1, topk_idx)
+                        actor_g = sample_actor_active.gather(-1, topk_idx)
+                        log_p_acro = F.log_softmax(ref_g + bias_g, dim=-1)
+                        log_q_acro = F.log_softmax(actor_g, dim=-1)
+                    elif english_vocab_mask is not None:
+                        log_p_acro = F.log_softmax(
+                            sample_ref_active[:, english_vocab_mask]
+                            + active_bias_full[:, english_vocab_mask],
+                            dim=-1,
+                        )
+                        log_q_acro = F.log_softmax(
+                            sample_actor_active[:, english_vocab_mask], dim=-1
+                        )
+                    else:
+                        log_p_acro = F.log_softmax(
+                            sample_ref_active + active_bias_full, dim=-1
+                        )
+                        log_q_acro = F.log_softmax(sample_actor_active, dim=-1)
+
+                    if run_acrostic_biased_ref:
+                        p_acro = log_p_acro.exp()
+                        kl_per = torch.sum(p_acro * (log_p_acro - log_q_acro), dim=-1)
+                        l_kl_biased_ref_acr_total = l_kl_biased_ref_acr_total + kl_per.sum()
+                    if run_acrostic_reverse_biased_ref:
+                        q_acro = log_q_acro.exp()
+                        kl_per = torch.sum(q_acro * (log_q_acro - log_p_acro), dim=-1)
+                        l_kl_biased_ref_rev_acr_total = l_kl_biased_ref_rev_acr_total + kl_per.sum()
+
+        # ----- Reduce and accumulate -----
+        # Each loss TERM has a single denominator = count of tokens that
+        # contribute to that term ("needed-loss tokens").
+        #   global   : every term uses batch_num_tokens (legacy)
+        #   per_task : each term uses its own contributing-token count
+        #              - biased_ref (pos non-acr + acrostic active)
+        #              - clean_ref  (neg response only)
+        #              - self-distill / L_green (pos non-acr response only)
+        #              - L_CE (every response token, regardless of task)
+        #
+        # Clamp to 1.0 to avoid div-by-zero when a task is absent (numerator
+        # is also 0 in that case so the term contributes 0).
+        per_task = (loss_normalization_mode == "per_task")
+        n_pos = float(batch_num_pos_nonacr_tokens or 0.0)
+        n_neg = float(batch_num_neg_tokens or 0.0)
+        n_acr = float(batch_num_acr_active_tokens or 0.0)
+        if per_task:
+            denom_biased_ref     = max(n_pos + n_acr, 1.0)   # biased-ref needs pos + acrostic active
+            denom_neg            = max(n_neg, 1.0)
+            denom_pos_only       = max(n_pos, 1.0)            # green/self-distill need only pos non-acr
+        else:
+            denom_biased_ref = denom_neg = denom_pos_only = float(batch_num_tokens)
+
+        # CE always uses full batch_num_tokens (one CE term per response token)
+        # — already accumulated above. No change here.
+
+        # ---- L_green (only fires for green/initials samples) ----
         if need_green:
-            l_green = l_green_total / batch_num_tokens * dp_size
+            l_green = l_green_total / denom_pos_only * dp_size
             loss = loss + green_loss_weight * l_green
             metrics["green_loss"] = l_green.detach().item()
 
+        # ---- KL(D̂_ref ‖ D_actor) — single combined bucket ----
         if need_kl_biased_ref:
-            l_kl_biased_ref_actor = l_kl_biased_ref_total / batch_num_tokens * dp_size
+            l_kl_biased_ref_actor = (
+                (l_kl_biased_ref_pos_total + l_kl_biased_ref_acr_total)
+                / denom_biased_ref * dp_size
+            )
             loss = loss + kl_biased_ref_actor_weight * l_kl_biased_ref_actor
             metrics["kl_biased_ref_actor"] = l_kl_biased_ref_actor.detach().item()
 
         if need_reverse_kl_biased_ref:
-            l_reverse_kl_biased_ref_actor = l_kl_biased_ref_rev_total / batch_num_tokens * dp_size
+            l_reverse_kl_biased_ref_actor = (
+                (l_kl_biased_ref_rev_pos_total + l_kl_biased_ref_rev_acr_total)
+                / denom_biased_ref * dp_size
+            )
             loss = loss + reverse_kl_biased_ref_actor_weight * l_reverse_kl_biased_ref_actor
             metrics["reverse_kl_biased_ref_actor"] = l_reverse_kl_biased_ref_actor.detach().item()
 
+        # ---- Clean-ref KL (neg-only anchor) ----
         if need_kl_ref:
-            l_kl_ref_actor = l_kl_ref_total / batch_num_tokens * dp_size
+            l_kl_ref_actor = l_kl_ref_total / denom_neg * dp_size
             loss = loss + kl_ref_actor_weight * l_kl_ref_actor
             metrics["kl_ref_actor"] = l_kl_ref_actor.detach().item()
 
         if need_reverse_kl_ref:
-            l_reverse_kl_ref_actor = l_kl_ref_rev_total / batch_num_tokens * dp_size
+            l_reverse_kl_ref_actor = l_kl_ref_rev_total / denom_neg * dp_size
             loss = loss + reverse_kl_ref_actor_weight * l_reverse_kl_ref_actor
             metrics["reverse_kl_ref_actor"] = l_reverse_kl_ref_actor.detach().item()
 
+        # ---- Self-distill (pos-non-acr only — already gated above) ----
         if need_kl_biased_actor:
-            l_kl_biased_actor_actor = l_kl_ba_total / batch_num_tokens * dp_size
+            l_kl_biased_actor_actor = l_kl_ba_total / denom_pos_only * dp_size
             loss = loss + kl_biased_actor_actor_weight * l_kl_biased_actor_actor
             metrics["kl_biased_actor_actor"] = l_kl_biased_actor_actor.detach().item()
 
         if need_reverse_kl_biased_actor:
-            l_kl_biased_actor_actor_reverse = l_kl_ba_rev_total / batch_num_tokens * dp_size
+            l_kl_biased_actor_actor_reverse = l_kl_ba_rev_total / denom_pos_only * dp_size
             loss = loss + reverse_kl_biased_actor_actor_weight * l_kl_biased_actor_actor_reverse
             metrics["kl_biased_actor_actor_reverse"] = l_kl_biased_actor_actor_reverse.detach().item()
 

@@ -185,6 +185,12 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
             elif task == "neg":
                 import numpy as np
                 mask_np = np.zeros(model_emb_length, dtype=bool)
+            elif task == "acrostics":
+                # Acrostic uses per-position bias from acrostic_bias_letter_idx +
+                # letter_bucket_masks; the static (N, V) green_mask is not
+                # consumed. Return an empty mask just to keep the tensor shape.
+                import numpy as np
+                mask_np = np.zeros(model_emb_length, dtype=bool)
             else:
                 raise ValueError(f"Unknown task: {task!r}")
 
@@ -208,6 +214,36 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
             else:
                 self._english_vocab_mask_cached = None
         return self._english_vocab_mask_cached
+
+    def _get_acrostic_letter_bucket_masks(self):
+        """Return ``(26, model_emb_length)`` bool tensor mapping letter idx →
+        token bucket. Lazily loaded from the configured letter_token_ids JSON
+        and cached on the worker. Returns None if config is missing.
+        """
+        if hasattr(self, "_acrostic_letter_masks_cached"):
+            return self._acrostic_letter_masks_cached
+
+        wm_cfg = self.config.get("watermark", {})
+        path = wm_cfg.get("acrostic_letter_token_ids", None)
+        if path is None:
+            self._acrostic_letter_masks_cached = None
+            return None
+        import json
+        from pathlib import Path
+        with open(Path(path)) as f:
+            d = json.load(f)
+        per_letter = d.get("per_letter_token_ids", d)
+
+        model_emb_length = self.actor_model_config.vocab_size
+        masks = torch.zeros(26, model_emb_length, dtype=torch.bool)
+        import string
+        for i, c in enumerate(string.ascii_lowercase):
+            ids = per_letter.get(c, [])
+            valid = [t for t in ids if t < model_emb_length]
+            if valid:
+                masks[i, torch.tensor(valid, dtype=torch.long)] = True
+        self._acrostic_letter_masks_cached = masks
+        return masks
 
     def _build_sample_green_masks(
         self,
@@ -277,6 +313,10 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
         green_target_ratio           = float(wm_cfg.get("green_target_ratio", 0.0))
         quality_green_topk           = int(wm_cfg.get("quality_green_topk", 0))
         distill_topk_biased_ref      = int(wm_cfg.get("distill_topk_biased_ref", 0))
+        loss_normalization_mode      = str(wm_cfg.get("loss_normalization_mode", "global"))
+        assert loss_normalization_mode in ("global", "per_task"), (
+            f"loss_normalization_mode must be 'global' or 'per_task', got {loss_normalization_mode!r}"
+        )
         # NOTE: kl_ref_actor / reverse_kl_ref_actor mathematically don't need
         # green masks for the loss term itself, but loss.py derives num_samples
         # from green_masks.shape[0] to drive the per-sample loop. Including these
@@ -335,6 +375,18 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
 
             # Per-sample task IDs (present when parquet has "task" column; else None)
             task_ids_all = batch["task_id"].to(device) if "task_id" in batch.keys() else None
+
+            # Acrostic bias: per-position letter idx (-1 = no bias, 0..25 = a..z)
+            # Loaded lazily from the configured letter_token_ids JSON (None when
+            # config absent → acrostic loss path skipped).
+            acrostic_letter_masks = self._get_acrostic_letter_bucket_masks()
+            if acrostic_letter_masks is not None:
+                acrostic_letter_masks = acrostic_letter_masks.to(device)
+            acrostic_bias_idx_actor = (
+                batch["acrostic_bias_letter_idx_actor"].to(device).long()
+                if "acrostic_bias_letter_idx_actor" in batch.keys()
+                else None
+            )
 
             if need_green_masks:
                 wm_seeds = batch["wm_seed"].to(device)               # (N,)
@@ -396,6 +448,56 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
             )
             batch_num_tokens_val = batch_num_tokens_local.item()
 
+            # --- Per-task token counts (for per_task normalization mode) ---
+            # Sample-level type indicators
+            TASK_ID_ACROSTIC = 3  # matches dataset.TASK_NAMES = (..., "acrostics")
+            if task_ids_all is not None:
+                sample_is_acr = (task_ids_all == TASK_ID_ACROSTIC)            # (N,)
+            else:
+                sample_is_acr = torch.zeros(N, dtype=torch.bool, device=device)
+            sample_is_neg = is_negative_all                                    # (N,)
+            sample_is_pos_nonacr = (~sample_is_neg) & (~sample_is_acr)         # (N,)
+
+            # Broadcast per-token (N, L_actor-1)
+            shifted_loss_mask_bool = loss_mask[:, 1:].bool()                   # (N, L_actor-1)
+            is_acr_per_tok = sample_is_acr.unsqueeze(1).expand_as(shifted_loss_mask_bool)
+            is_neg_per_tok = sample_is_neg.unsqueeze(1).expand_as(shifted_loss_mask_bool)
+            is_pos_nonacr_per_tok = sample_is_pos_nonacr.unsqueeze(1).expand_as(shifted_loss_mask_bool)
+
+            # Local counts (response tokens per task type)
+            n_pos_nonacr_tokens_local = (shifted_loss_mask_bool & is_pos_nonacr_per_tok).sum().to(dtype=torch.float64)
+            n_neg_tokens_local        = (shifted_loss_mask_bool & is_neg_per_tok).sum().to(dtype=torch.float64)
+            n_acr_response_tokens_local = (shifted_loss_mask_bool & is_acr_per_tok).sum().to(dtype=torch.float64)
+
+            # Acrostic active token count: bias_idx >= 0 within response region
+            if acrostic_bias_idx_actor is not None:
+                shifted_acr_bias = acrostic_bias_idx_actor[:, 1:]              # (N, L_actor-1)
+                n_acr_active_tokens_local = (
+                    (shifted_acr_bias >= 0) & shifted_loss_mask_bool & is_acr_per_tok
+                ).sum().to(dtype=torch.float64)
+            else:
+                n_acr_active_tokens_local = torch.zeros(1, dtype=torch.float64, device=device).squeeze()
+
+            # Single all-reduce for all 4 counts
+            per_task_counts = torch.stack([
+                n_pos_nonacr_tokens_local,
+                n_neg_tokens_local,
+                n_acr_response_tokens_local,
+                n_acr_active_tokens_local,
+            ])
+            torch.distributed.all_reduce(per_task_counts, op=torch.distributed.ReduceOp.SUM)
+            batch_num_pos_nonacr_tokens_val = float(per_task_counts[0].item())
+            batch_num_neg_tokens_val        = float(per_task_counts[1].item())
+            batch_num_acr_response_tokens_val = float(per_task_counts[2].item())
+            batch_num_acr_active_tokens_val   = float(per_task_counts[3].item())
+
+            # Sanity: pos_nonacr + neg + acr_response should equal batch_num_tokens
+            _sum_check = batch_num_pos_nonacr_tokens_val + batch_num_neg_tokens_val + batch_num_acr_response_tokens_val
+            assert abs(_sum_check - batch_num_tokens_val) < 0.5, (
+                f"Per-task token counts {_sum_check} do not sum to "
+                f"batch_num_tokens {batch_num_tokens_val}"
+            )
+
             # --- Response-position indices ---
             resp_idx_actor = loss_mask_flat.bool()       # (N*(L_actor-1),)
             if need_ref_forward:
@@ -442,6 +544,17 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                     per_sample_strengths[s:e] if per_sample_strengths is not None else None
                 )
                 mb_task_ids = task_ids_all[s:e] if task_ids_all is not None else None
+
+                # Acrostic per-position bias index, response-aligned via the
+                # same [:, 1:] shift used for input_ids_rolled. mb_resp_idx_actor
+                # selection ensures we only forward bias indices at loss-active
+                # response positions.
+                if acrostic_bias_idx_actor is not None:
+                    mb_acrostic_bias_idx_flat = (
+                        acrostic_bias_idx_actor[s:e, 1:].contiguous().view(-1)
+                    )[mb_resp_idx_actor]
+                else:
+                    mb_acrostic_bias_idx_flat = None
 
                 with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
                     if need_ref_forward:
@@ -512,6 +625,12 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                         sample_is_negative=mb_is_negative,
                         sample_strengths=mb_sample_strengths,
                         sample_task_ids=mb_task_ids,
+                        acrostic_bias_letter_idx=mb_acrostic_bias_idx_flat,
+                        acrostic_letter_bucket_masks=acrostic_letter_masks,
+                        loss_normalization_mode=loss_normalization_mode,
+                        batch_num_pos_nonacr_tokens=batch_num_pos_nonacr_tokens_val,
+                        batch_num_neg_tokens=batch_num_neg_tokens_val,
+                        batch_num_acr_active_tokens=batch_num_acr_active_tokens_val,
                     )
 
                     loss.backward()
