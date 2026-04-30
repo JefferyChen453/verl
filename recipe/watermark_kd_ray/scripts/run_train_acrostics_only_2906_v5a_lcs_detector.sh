@@ -1,23 +1,27 @@
 #!/usr/bin/env bash
-# V5b: V5a config + LCS detector + n_resample=1000 (vs V5a's hits-z, 200).
-#
-# Same training side as V5a (sparse parquet, strength=10, per_task norm) —
-# the ONLY change is the val/reward acrostic detector:
+# V5a-lcs-detector: identical training to V5a (sparse parquet, strength=10,
+# per_task norm). The ONLY change is val/reward detector:
 #   acrostics_detector_kind: hits → lcs
 #   acrostics_n_resample:    200  → 1000
 #
+# Training side bit-identical to V5a (KD loss uses ground-truth bias_idx,
+# not detector output). Goal of this run is purely to compare val curves
+# under LCS detector against V5a's hits-z curves over epochs 1-2.
+#
+# max_actor_ckpt_to_keep=2: keeps only the last 2 epoch ckpts. Combined
+# with V5a's 4 epoch ckpts (or the 2 we kept), total 4 ckpts available
+# for cross-detector eval.
+#
 # Why LCS:
-#   - hits-z's fail_streak=3 skip mechanism is brittle: 3 noise letters in
-#     a row trigger skip, dropping subsequent real matches. Empirical 12-
-#     char insertion attack on filtered KD pilot: hits-z AUC drops 6.5pp,
-#     LCS-z drops only 1.0pp.
-#   - SW (Smith-Waterman) has gap penalty that drowns spread-out hits.
+#   - hits-z's fail_streak=3 skip is brittle: 3 noise letters trigger skip,
+#     dropping subsequent real matches. Empirical 12-char insertion attack
+#     on filtered KD pilot: hits-z AUC drops 6.5pp, LCS only 1.0pp.
+#   - SW gap penalty drowns spread-out hits.
 #   - LCS = pure subsequence DP, no skip/penalty. Mentor-recommended.
 #
 # Why n_resample=1000:
-#   - LCS null mean is higher than hits null (richer multiset → more
-#     ordered subsequences). Tighter sigma needed for sensitive z.
-#   - Already used at filter time; matches.
+#   - LCS null mean is higher than hits null (rich multiset → more ordered
+#     subseqs in shuffles). Tighter sigma needed for sensitive z.
 set -euo pipefail
 
 DATE=$(date +%Y%m%d%H%M)
@@ -71,7 +75,8 @@ export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0;9.0}"
     trainer.total_epochs=4 \
     trainer.test_freq=30 \
     trainer.save_freq=after_each_epoch \
+    trainer.max_actor_ckpt_to_keep=2 \
     trainer.val_before_train=true \
     trainer.project_name=watermark-kd-ray \
-    trainer.experiment_name=acrostics_only_2906_v5b_sparse_s10_lcs1000_${DATE} \
-    2>&1 | tee "logs/acrostics_only_2906_v5b_sparse_s10_lcs1000_${DATE}.log"
+    trainer.experiment_name=acrostics_only_2906_v5a_lcs_detector_${DATE} \
+    2>&1 | tee "logs/acrostics_only_2906_v5a_lcs_detector_${DATE}.log"
