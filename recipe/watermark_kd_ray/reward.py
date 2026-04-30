@@ -86,7 +86,55 @@ class _HitsZAcrosticDetector:
         return self.detect(token_list)
 
 
-def _build_acrostics_detector(target, tokenizer, n_resample: int = 200, seed: int = 0):
+class _LcsZAcrosticDetector:
+    """Adapter wrapping ``acrostics_zstat.compute_lcs_zstat`` with a
+    ``unidetect(token_list) -> float`` API for the reward fn.
+
+    LCS-based detector with shuffle-S null. Drops the controller's
+    fail_streak skip mechanism, so a few noise letters in fl don't kill
+    real subsequent matches. Empirically: 12-char insertion attack drops
+    AUC by 1pp (vs 6.5pp for hits-z) on filtered KD pilot data
+    (2026-04-30 robustness analysis).
+    """
+
+    def __init__(self, target: str, tokenizer, n_resample: int = 1000,
+                 seed: int = 0):
+        assert tokenizer is not None
+        assert isinstance(target, str) and len(target) > 0
+        self.target = target
+        self.tokenizer = tokenizer
+        self.n_resample = int(n_resample)
+        self.seed = int(seed)
+
+    def _decode(self, token_list):
+        return self.tokenizer.decode(token_list, skip_special_tokens=True)
+
+    def detect(self, token_list):
+        from acrostics_zstat import compute_lcs_zstat
+        text = self._decode(token_list)
+        stat = compute_lcs_zstat(
+            text=text, target=self.target, extractor="md",
+            n_resample=self.n_resample, seed=self.seed,
+        )
+        return float(stat.z)
+
+    def unidetect(self, token_list):
+        return self.detect(token_list)
+
+
+def _build_acrostics_detector(target, tokenizer, n_resample: int = 200,
+                              seed: int = 0, kind: str = "hits"):
+    """Build an acrostic detector. ``kind`` selects the metric:
+      - 'hits' (default, back-compat): controller-walk hits + shuffle-S null
+      - 'lcs': LCS length + shuffle-S null (robust to insertion noise)
+    """
+    if kind == "lcs":
+        return _LcsZAcrosticDetector(
+            target=target, tokenizer=tokenizer,
+            n_resample=n_resample, seed=seed,
+        )
+    if kind != "hits":
+        raise ValueError(f"acrostic_detector kind must be 'hits' or 'lcs', got {kind!r}")
     return _HitsZAcrosticDetector(
         target=target, tokenizer=tokenizer,
         n_resample=n_resample, seed=seed,
@@ -118,6 +166,7 @@ class WatermarkZScoreRewardFn:
         eval_initials_seed: int = 0,
         acrostics_target: str = "asdf",
         acrostics_n_resample: int = 200,
+        acrostics_detector_kind: str = "hits",
     ):
         assert tokenizer is not None, "tokenizer must be provided"
         self.tokenizer = tokenizer
@@ -152,6 +201,7 @@ class WatermarkZScoreRewardFn:
                 target=acrostics_target,
                 tokenizer=tokenizer,
                 n_resample=acrostics_n_resample,
+                kind=acrostics_detector_kind,
             )
         self.default_detector_key = self.eval_tasks[0]
         self.mode = "mixed" if len(self.eval_tasks) > 1 else self.eval_tasks[0]

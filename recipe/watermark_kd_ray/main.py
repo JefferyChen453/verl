@@ -158,6 +158,7 @@ class TaskRunner:
             eval_initials_seed=config.watermark.get("eval_initials_seed", 0),
             acrostics_target=acrostics_target,
             acrostics_n_resample=config.watermark.get("acrostics_n_resample", 200),
+            acrostics_detector_kind=config.watermark.get("acrostics_detector_kind", "hits"),
         )
 
         # ---- Trainer ----
