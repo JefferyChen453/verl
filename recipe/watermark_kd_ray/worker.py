@@ -318,6 +318,8 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
             f"loss_normalization_mode must be 'global' or 'per_task', got {loss_normalization_mode!r}"
         )
         acrostic_kl_full_response    = bool(wm_cfg.get("acrostic_kl_full_response", False))
+        acrostic_active_weight       = float(wm_cfg.get("acrostic_active_weight", 1.0))
+        acrostic_inactive_weight     = float(wm_cfg.get("acrostic_inactive_weight", 1.0))
         # NOTE: kl_ref_actor / reverse_kl_ref_actor mathematically don't need
         # green masks for the loss term itself, but loss.py derives num_samples
         # from green_masks.shape[0] to drive the per-sample loop. Including these
@@ -634,6 +636,8 @@ class WatermarkActorRolloutRefWorker(AsyncActorRolloutRefWorker):
                         batch_num_acr_active_tokens=batch_num_acr_active_tokens_val,
                         batch_num_acr_full_tokens=batch_num_acr_response_tokens_val,
                         acrostic_kl_full_response=acrostic_kl_full_response,
+                        acrostic_active_weight=acrostic_active_weight,
+                        acrostic_inactive_weight=acrostic_inactive_weight,
                     )
 
                     loss.backward()

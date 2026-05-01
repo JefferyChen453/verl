@@ -151,9 +151,20 @@ watermark:
   #   true:            KL covers ALL response tokens of acrostic samples;
   #                    inactive positions use bias=0 → KL(D_ref ‖ D_actor)
   #                    so the model is anchored to ref between letters too.
-  # When true, denom_biased_ref_fwd switches to (n_pos + n_acr_full) under
+  # When true, denom_biased_ref_fwd switches to (n_pos + weighted n_acr) under
   # per_task normalization. Reverse biased-ref path is unaffected.
   acrostic_kl_full_response: false
+
+  # Per-token weights (used ONLY when acrostic_kl_full_response=true).
+  # Standard weighted-mean: numerator multiplies active KL by active_weight and
+  # inactive KL by inactive_weight; denom uses the same weights so this is a
+  # proper weighted mean (not a global scale of total loss).
+  # Defaults 1.0/1.0 = unweighted fullkl (current behavior, back-compat).
+  # Setting active=5 / inactive=1 amplifies the letter-bias signal 5× relative
+  # to the inactive ref-anchor, mitigating active-signal dilution at the cost
+  # of less aggressive ref anchoring on non-letter positions.
+  acrostic_active_weight: 1.0
+  acrostic_inactive_weight: 1.0
 
   # Optional per-task strength override for biased-ref construction.
   # NOT set by default — when absent, loss uses the global ``strength`` for

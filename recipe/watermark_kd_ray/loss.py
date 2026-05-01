@@ -76,6 +76,8 @@ def compute_watermark_kd_loss(
     batch_num_acr_active_tokens: Optional[float] = None,
     batch_num_acr_full_tokens: Optional[float] = None,
     acrostic_kl_full_response: bool = False,
+    acrostic_active_weight: float = 1.0,
+    acrostic_inactive_weight: float = 1.0,
 ):
     """
     Compute combined watermark KD loss on response-only flattened tensors.
@@ -459,6 +461,25 @@ def compute_watermark_kd_loss(
                     kl_per_fwd = torch.sum(
                         p_acro_fwd * (log_p_acro_fwd - log_q_acro_fwd), dim=-1
                     )
+                    # Per-token weighting: active letter-bearing positions can be
+                    # weighted up vs inactive positions. Defaults 1.0/1.0 = standard
+                    # unweighted fullkl mean (back-compat). With e.g. (5.0, 1.0) the
+                    # active letter-bias signal contributes 5× per token, and the
+                    # denom is correspondingly weighted (see per_task denom below)
+                    # so this is a proper weighted-mean (not a 5× scale of total loss).
+                    if acrostic_active_weight != 1.0 or acrostic_inactive_weight != 1.0:
+                        weight_per_token = torch.where(
+                            active_mask_i,
+                            torch.tensor(
+                                acrostic_active_weight,
+                                dtype=kl_per_fwd.dtype, device=kl_per_fwd.device,
+                            ),
+                            torch.tensor(
+                                acrostic_inactive_weight,
+                                dtype=kl_per_fwd.dtype, device=kl_per_fwd.device,
+                            ),
+                        )
+                        kl_per_fwd = kl_per_fwd * weight_per_token
                     l_kl_biased_ref_acr_total = l_kl_biased_ref_acr_total + kl_per_fwd.sum()
 
                 # Active-only path: (a) reverse always; (b) forward when not in fullkl mode.
@@ -539,12 +560,22 @@ def compute_watermark_kd_loss(
         n_neg = float(batch_num_neg_tokens or 0.0)
         n_acr_active = float(batch_num_acr_active_tokens or 0.0)
         n_acr_full   = float(batch_num_acr_full_tokens or 0.0)
+        n_acr_inactive = max(n_acr_full - n_acr_active, 0.0)
         if per_task:
             # Forward and reverse biased-ref get separate denominators because
             # acrostic_kl_full_response only enlarges the FORWARD numerator
             # (full response) while reverse stays active-only.
             if acrostic_kl_full_response:
-                denom_biased_ref_fwd = max(n_pos + n_acr_full, 1.0)
+                # Weighted denom matches the per-token weighting applied above:
+                # active token counts as `acrostic_active_weight`, inactive as
+                # `acrostic_inactive_weight`. With both = 1.0 this collapses to
+                # n_pos + n_acr_full (back-compat).
+                denom_biased_ref_fwd = max(
+                    n_pos
+                    + acrostic_active_weight * n_acr_active
+                    + acrostic_inactive_weight * n_acr_inactive,
+                    1.0,
+                )
                 denom_biased_ref_rev = max(n_pos + n_acr_active, 1.0)
             else:
                 denom_biased_ref_fwd = max(n_pos + n_acr_active, 1.0)
