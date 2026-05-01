@@ -146,6 +146,15 @@ watermark:
   max_grad_norm: 1.0
   gradient_accumulation_steps: 1
 
+  # Acrostic forward biased-ref KL coverage (experimental, exp/acrostic-fullkl).
+  #   false (default): KL only at letter-bearing positions (V5a-lcs behavior).
+  #   true:            KL covers ALL response tokens of acrostic samples;
+  #                    inactive positions use bias=0 → KL(D_ref ‖ D_actor)
+  #                    so the model is anchored to ref between letters too.
+  # When true, denom_biased_ref_fwd switches to (n_pos + n_acr_full) under
+  # per_task normalization. Reverse biased-ref path is unaffected.
+  acrostic_kl_full_response: false
+
   # Optional per-task strength override for biased-ref construction.
   # NOT set by default — when absent, loss uses the global ``strength`` for
   # every sample (preserves backward compat with old posneg scripts). Mixed

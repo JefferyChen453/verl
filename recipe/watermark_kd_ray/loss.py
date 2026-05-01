@@ -74,6 +74,8 @@ def compute_watermark_kd_loss(
     batch_num_pos_nonacr_tokens: Optional[float] = None,
     batch_num_neg_tokens: Optional[float] = None,
     batch_num_acr_active_tokens: Optional[float] = None,
+    batch_num_acr_full_tokens: Optional[float] = None,
+    acrostic_kl_full_response: bool = False,
 ):
     """
     Compute combined watermark KD loss on response-only flattened tensors.
@@ -380,15 +382,90 @@ def compute_watermark_kd_loss(
                 kl_per_token = torch.sum(p * (log_p - log_q), dim=-1)
                 l_kl_ba_rev_total = l_kl_ba_rev_total + kl_per_token.sum()
 
-            # ---- Acrostic per-position biased KL (sentence-start positions only) ----
-            # Bias is per-token: at active positions (acrostic_bias_letter_idx >= 0),
-            # bias = strength * letter_bucket_mask[letter_idx]. KL is computed only
-            # at active positions. Top-K and english_vocab_mask are applied the
-            # same way as the green/initials biased path for consistency.
+            # ---- Acrostic per-position biased KL ----
+            # Default (acrostic_kl_full_response=False, V5a-lcs behavior):
+            #   Bias is per-token: at active positions (bias_letter_idx >= 0),
+            #   bias = strength * letter_bucket_mask[letter_idx]. KL is computed
+            #   ONLY at active positions; other response tokens contribute 0.
+            #
+            # Full-response mode (acrostic_kl_full_response=True, exp branch):
+            #   Forward biased-ref KL covers ALL response tokens. Active
+            #   positions: bias = letter bias (same as default). Inactive
+            #   positions: bias = 0, so the KL degenerates to KL(D_ref ‖ D_actor)
+            #   — pure distillation anchor that teaches the model "after writing
+            #   the seeded letter, stay close to ref" instead of leaving the
+            #   non-letter positions ungoverned.
+            #
+            # The reverse_biased_ref branch is intentionally unchanged (still
+            # active-only) — fullkl mode is forward-only by design.
             if run_acrostic_biased_ref or run_acrostic_reverse_biased_ref:
                 acro_bias_idx_i = acrostic_bias_letter_idx[token_mask]   # (n_tokens,)
                 active_mask_i = acro_bias_idx_i >= 0
-                if int(active_mask_i.sum().item()) > 0:
+                fullkl_fwd = bool(acrostic_kl_full_response) and run_acrostic_biased_ref
+
+                if fullkl_fwd:
+                    # Forward path covers all response tokens of this sample.
+                    sample_actor_full = actor_logits[token_mask]                 # (n_resp, V)
+                    sample_ref_full   = ref_logits[token_mask]                   # (n_resp, V)
+                    n_resp = sample_actor_full.shape[0]
+                    s_i = (
+                        float(sample_strengths[i].item())
+                        if sample_strengths is not None
+                        else strength
+                    )
+                    # Build (n_resp, V) bias tensor: 0 everywhere except active rows.
+                    bias_full_fwd = torch.zeros_like(sample_actor_full)
+                    if int(active_mask_i.sum().item()) > 0:
+                        active_letter_idx_full = acro_bias_idx_i[active_mask_i].long()
+                        bias_full_fwd[active_mask_i] = (
+                            s_i
+                            * acrostic_letter_bucket_masks[active_letter_idx_full].to(
+                                sample_actor_full.dtype
+                            )
+                        )
+
+                    if distill_topk_biased_ref > 0:
+                        biased_full_fwd = sample_ref_full + bias_full_fwd
+                        if english_vocab_mask is not None:
+                            biased_full_fwd = biased_full_fwd.masked_fill(
+                                ~english_vocab_mask.unsqueeze(0), float("-inf")
+                            )
+                            max_k = int(english_vocab_mask.sum().item())
+                        else:
+                            max_k = biased_full_fwd.shape[-1]
+                        k = min(distill_topk_biased_ref, max_k)
+                        topk_idx = biased_full_fwd.topk(k, dim=-1).indices       # (n_resp, K)
+                        ref_g = sample_ref_full.gather(-1, topk_idx)
+                        bias_g = bias_full_fwd.gather(-1, topk_idx)
+                        actor_g = sample_actor_full.gather(-1, topk_idx)
+                        log_p_acro_fwd = F.log_softmax(ref_g + bias_g, dim=-1)
+                        log_q_acro_fwd = F.log_softmax(actor_g, dim=-1)
+                    elif english_vocab_mask is not None:
+                        log_p_acro_fwd = F.log_softmax(
+                            sample_ref_full[:, english_vocab_mask]
+                            + bias_full_fwd[:, english_vocab_mask],
+                            dim=-1,
+                        )
+                        log_q_acro_fwd = F.log_softmax(
+                            sample_actor_full[:, english_vocab_mask], dim=-1
+                        )
+                    else:
+                        log_p_acro_fwd = F.log_softmax(
+                            sample_ref_full + bias_full_fwd, dim=-1
+                        )
+                        log_q_acro_fwd = F.log_softmax(sample_actor_full, dim=-1)
+
+                    p_acro_fwd = log_p_acro_fwd.exp()
+                    kl_per_fwd = torch.sum(
+                        p_acro_fwd * (log_p_acro_fwd - log_q_acro_fwd), dim=-1
+                    )
+                    l_kl_biased_ref_acr_total = l_kl_biased_ref_acr_total + kl_per_fwd.sum()
+
+                # Active-only path: (a) reverse always; (b) forward when not in fullkl mode.
+                # When fullkl_fwd is True, we skip the active-only forward to avoid
+                # double-counting (already accumulated above).
+                run_active_only_fwd = run_acrostic_biased_ref and not fullkl_fwd
+                if (run_active_only_fwd or run_acrostic_reverse_biased_ref) and int(active_mask_i.sum().item()) > 0:
                     s_i = (
                         float(sample_strengths[i].item())
                         if sample_strengths is not None
@@ -404,7 +481,6 @@ def compute_watermark_kd_loss(
                             sample_actor_active.dtype
                         )
                     )                                                                  # (n_act, V)
-                    n_act = sample_actor_active.shape[0]
 
                     if distill_topk_biased_ref > 0:
                         biased_full = sample_ref_active + active_bias_full
@@ -437,7 +513,7 @@ def compute_watermark_kd_loss(
                         )
                         log_q_acro = F.log_softmax(sample_actor_active, dim=-1)
 
-                    if run_acrostic_biased_ref:
+                    if run_active_only_fwd:
                         p_acro = log_p_acro.exp()
                         kl_per = torch.sum(p_acro * (log_p_acro - log_q_acro), dim=-1)
                         l_kl_biased_ref_acr_total = l_kl_biased_ref_acr_total + kl_per.sum()
@@ -461,13 +537,22 @@ def compute_watermark_kd_loss(
         per_task = (loss_normalization_mode == "per_task")
         n_pos = float(batch_num_pos_nonacr_tokens or 0.0)
         n_neg = float(batch_num_neg_tokens or 0.0)
-        n_acr = float(batch_num_acr_active_tokens or 0.0)
+        n_acr_active = float(batch_num_acr_active_tokens or 0.0)
+        n_acr_full   = float(batch_num_acr_full_tokens or 0.0)
         if per_task:
-            denom_biased_ref     = max(n_pos + n_acr, 1.0)   # biased-ref needs pos + acrostic active
+            # Forward and reverse biased-ref get separate denominators because
+            # acrostic_kl_full_response only enlarges the FORWARD numerator
+            # (full response) while reverse stays active-only.
+            if acrostic_kl_full_response:
+                denom_biased_ref_fwd = max(n_pos + n_acr_full, 1.0)
+                denom_biased_ref_rev = max(n_pos + n_acr_active, 1.0)
+            else:
+                denom_biased_ref_fwd = max(n_pos + n_acr_active, 1.0)
+                denom_biased_ref_rev = max(n_pos + n_acr_active, 1.0)
             denom_neg            = max(n_neg, 1.0)
             denom_pos_only       = max(n_pos, 1.0)            # green/self-distill need only pos non-acr
         else:
-            denom_biased_ref = denom_neg = denom_pos_only = float(batch_num_tokens)
+            denom_biased_ref_fwd = denom_biased_ref_rev = denom_neg = denom_pos_only = float(batch_num_tokens)
 
         # CE always uses full batch_num_tokens (one CE term per response token)
         # — already accumulated above. No change here.
@@ -482,7 +567,7 @@ def compute_watermark_kd_loss(
         if need_kl_biased_ref:
             l_kl_biased_ref_actor = (
                 (l_kl_biased_ref_pos_total + l_kl_biased_ref_acr_total)
-                / denom_biased_ref * dp_size
+                / denom_biased_ref_fwd * dp_size
             )
             loss = loss + kl_biased_ref_actor_weight * l_kl_biased_ref_actor
             metrics["kl_biased_ref_actor"] = l_kl_biased_ref_actor.detach().item()
@@ -490,7 +575,7 @@ def compute_watermark_kd_loss(
         if need_reverse_kl_biased_ref:
             l_reverse_kl_biased_ref_actor = (
                 (l_kl_biased_ref_rev_pos_total + l_kl_biased_ref_rev_acr_total)
-                / denom_biased_ref * dp_size
+                / denom_biased_ref_rev * dp_size
             )
             loss = loss + reverse_kl_biased_ref_actor_weight * l_reverse_kl_biased_ref_actor
             metrics["reverse_kl_biased_ref_actor"] = l_reverse_kl_biased_ref_actor.detach().item()
