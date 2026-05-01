@@ -58,7 +58,8 @@ class PerSampleWatermarkZScoreRewardFn:
         stats_file: str = "data/initials_icw/leading_space_first_letter_stats.json",
         active_tasks: Optional[list] = None,
         acrostics_target: str = "asdf",
-        acrostics_n_resample: int = 200,
+        acrostics_n_resample: int = 1000,
+        acrostics_detector_kind: str = "lcs",
     ):
         assert tokenizer is not None
         self.tokenizer = tokenizer
@@ -70,6 +71,9 @@ class PerSampleWatermarkZScoreRewardFn:
         self.active_tasks = list(active_tasks) if active_tasks else ["green", "initials"]
         self.acrostics_target = acrostics_target
         self.acrostics_n_resample = int(acrostics_n_resample)
+        if acrostics_detector_kind not in ("hits", "lcs"):
+            raise ValueError(f"acrostics_detector_kind must be 'hits' or 'lcs', got {acrostics_detector_kind!r}")
+        self.acrostics_detector_kind = acrostics_detector_kind
 
         # Detector cache: {(task, seed, frac_key): detector}
         self._cache: Dict[tuple, object] = {}
@@ -115,13 +119,17 @@ class PerSampleWatermarkZScoreRewardFn:
                 tokenizer=self.tokenizer,
             )
         elif task == "acrostics":
-            from gptwm_acrostics import AcrosticsDetector
+            # Reuse KD recipe's md-extractor + hits/lcs zstat adapter so RL
+            # train/val and KD val all share the exact same detector pipeline
+            # (extractor='md', no strict regex). Default kind='lcs' picks the
+            # production detector validated on test_477 (AUC 0.94→0.99).
+            from recipe.watermark_kd_ray.reward import _build_acrostics_detector
             t = target if target else self.acrostics_target
-            det = AcrosticsDetector(
+            det = _build_acrostics_detector(
                 target=t,
                 tokenizer=self.tokenizer,
                 n_resample=self.acrostics_n_resample,
-                strict=True,   # strict mode blocks heading/list reward-hack
+                kind=self.acrostics_detector_kind,
             )
         else:
             raise ValueError(f"unknown task {task!r}")
