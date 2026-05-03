@@ -129,7 +129,8 @@ reward:
   eval_green_seed: 0
   eval_green_fraction: 0.25
   eval_initials_seed: 0
-  acrostics_target: asdf
+  # acrostic target is per-sample, read from data.non_tensor_batch['acrostic_target']
+  # in reward fn — no code/yaml default (2026-05-02 refactor; see commit notes).
   acrostics_n_resample: 1000          # match KD eval (LCS @ 1000); 200 was hits-z hot path
   acrostics_detector_kind: "lcs"      # 'lcs' (extractor='md', LCS+shuffle-S) or 'hits' (controller-walk)
 

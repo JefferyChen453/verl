@@ -378,6 +378,13 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
             else:
                 sample_tasks.extend(["unknown"] * len(test_batch.batch["input_ids"]))
 
+            # Save fields needed by val_reward_fn before _get_gen_batch pops them.
+            # _get_gen_batch (verl.trainer.ppo.ray_trainer:514) moves all non-reward
+            # non_tensor keys into gen_batch; rollout doesn't always preserve them in
+            # its output. We re-attach `acrostic_target` and `task` after rollout.
+            preserved_acr_target = test_batch.non_tensor_batch.get("acrostic_target", None)
+            preserved_task = test_batch.non_tensor_batch.get("task", None)
+
             input_ids = test_batch.batch["input_ids"]
             attention_mask = test_batch.batch["attention_mask"]
             batch_prompt_token_lengths = attention_mask.sum(-1).cpu().tolist()
@@ -449,6 +456,13 @@ class WatermarkKDRayTrainer(RayPPOTrainer):
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
+
+            # Re-attach preserved non_tensor fields that _get_gen_batch popped
+            # and rollout didn't carry through.
+            if preserved_acr_target is not None and "acrostic_target" not in test_batch.non_tensor_batch:
+                test_batch.non_tensor_batch["acrostic_target"] = preserved_acr_target
+            if preserved_task is not None and "task" not in test_batch.non_tensor_batch:
+                test_batch.non_tensor_batch["task"] = preserved_task
 
             if self.val_reward_fn is None:
                 raise ValueError("val_reward_fn must be provided for validation.")

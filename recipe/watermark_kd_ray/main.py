@@ -126,22 +126,10 @@ class TaskRunner:
             )
 
         # ---- Val reward function (z-score) ----
+        # Per-sample acrostic target read from data.non_tensor_batch['acrostic_target'];
+        # no code-level fallback (2026-05-02 refactor — secret string lives in
+        # the parquet only to prevent silent target mismatches).
         from recipe.watermark_kd_ray.reward import WatermarkZScoreRewardFn
-
-        # Build acrostics target from seed+length if config provides them and
-        # the explicit string isn't set (mirrors how green/initials use seeds).
-        acrostics_target = config.watermark.get("acrostics_target", None)
-        if acrostics_target is None:
-            acr_seed = int(config.watermark.get("eval_acrostic_seed", 0))
-            acr_len = int(config.watermark.get("eval_acrostic_length", 18))
-            try:
-                from acrostics_icw import sample_target_icw, ICW_LETTER_POOL
-                acrostics_target = sample_target_icw(
-                    seed=acr_seed, length=acr_len, pool=ICW_LETTER_POOL,
-                    uppercase=True,
-                )
-            except ImportError:
-                acrostics_target = "asdf"  # fallback default
 
         val_reward_fn = WatermarkZScoreRewardFn(
             tokenizer=tokenizer,
@@ -156,7 +144,6 @@ class TaskRunner:
             eval_green_seed=config.watermark.get("eval_green_seed", 1),
             eval_green_fraction=config.watermark.get("eval_green_fraction", 0.25),
             eval_initials_seed=config.watermark.get("eval_initials_seed", 0),
-            acrostics_target=acrostics_target,
             acrostics_n_resample=config.watermark.get("acrostics_n_resample", 200),
             acrostics_detector_kind=config.watermark.get("acrostics_detector_kind", "hits"),
         )

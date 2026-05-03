@@ -164,10 +164,18 @@ class WatermarkZScoreRewardFn:
         eval_green_seed: int = 1,
         eval_green_fraction: float = 0.25,
         eval_initials_seed: int = 0,
-        acrostics_target: str = "asdf",
         acrostics_n_resample: int = 200,
         acrostics_detector_kind: str = "hits",
     ):
+        """Acrostic detector is built lazily per per-sample target string read
+        from ``data.non_tensor_batch['acrostic_target']`` at __call__ time.
+
+        Hard-fails (no fallback) if the val parquet does not provide a
+        non-empty ``acrostic_target`` for samples whose detection routes
+        through the acrostic detector. This forces the secret-string design
+        to live in the data, never in code defaults — preventing silent
+        target mismatches like the 2026-05-02 'asdf' bug.
+        """
         assert tokenizer is not None, "tokenizer must be provided"
         self.tokenizer = tokenizer
         self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
@@ -178,6 +186,8 @@ class WatermarkZScoreRewardFn:
         if unknown:
             raise ValueError(f"eval_tasks must be subset of {{green, initials, acrostics}}; got {unknown}")
 
+        # green/initials use seeds (one fixed detector per task). Acrostic is
+        # per-sample: lazy-built on first use, cached by target string.
         self.detectors: Dict[str, object] = {}
         if "green" in self.eval_tasks:
             self.detectors["green"] = _build_green_detector(
@@ -196,36 +206,76 @@ class WatermarkZScoreRewardFn:
                 model_config=model_config,
                 stats_file=stats_file,
             )
-        if "acrostics" in self.eval_tasks:
-            self.detectors["acrostics"] = _build_acrostics_detector(
-                target=acrostics_target,
-                tokenizer=tokenizer,
-                n_resample=acrostics_n_resample,
-                kind=acrostics_detector_kind,
-            )
+
+        # Acrostic params kept as instance state for lazy detector build
+        self._acrostic_in_eval = "acrostics" in self.eval_tasks
+        self._acrostic_n_resample = int(acrostics_n_resample)
+        self._acrostic_detector_kind = acrostics_detector_kind
+        # cache: target_str -> detector
+        self._acrostic_detectors: Dict[str, object] = {}
+
         self.default_detector_key = self.eval_tasks[0]
         self.mode = "mixed" if len(self.eval_tasks) > 1 else self.eval_tasks[0]
 
-    # Back-compat: some callers may reference self.detector as a scalar
+    def _get_acrostic_detector(self, target: str):
+        """Return cached or freshly-built acrostic detector for ``target``.
+        Hard-fails on empty/None target (no fallback)."""
+        if not isinstance(target, str) or not target:
+            raise ValueError(
+                f"acrostic_target must be a non-empty string; got {target!r}. "
+                "Per-sample acrostic_target is required in data.non_tensor_batch — "
+                "fix the val/train parquet to populate it."
+            )
+        det = self._acrostic_detectors.get(target)
+        if det is None:
+            det = _build_acrostics_detector(
+                target=target,
+                tokenizer=self.tokenizer,
+                n_resample=self._acrostic_n_resample,
+                kind=self._acrostic_detector_kind,
+            )
+            self._acrostic_detectors[target] = det
+        return det
+
+    # Back-compat: some callers may reference self.detector as a scalar.
+    # For acrostic-only eval this is meaningless (per-sample), so raise.
     @property
     def detector(self):
+        if self._acrostic_in_eval and self.default_detector_key == "acrostics":
+            raise RuntimeError(
+                "acrostic detector is per-sample; access via _get_acrostic_detector(target)"
+            )
         return self.detectors[self.default_detector_key]
+
+    def _detector_keys(self) -> List[str]:
+        """Detector keys reported in extra metrics. Includes 'acrostics' as a
+        virtual key when in eval_tasks (each sample uses its own target)."""
+        keys = list(self.detectors.keys())
+        if self._acrostic_in_eval:
+            keys.append("acrostics")
+        return keys
 
     def __call__(self, data, return_dict: bool = True):
         """
-        Expected ``data.batch["responses"]`` shape (B, T). Task labels are read
-        from ``data.non_tensor_batch["task"]`` when present; otherwise every
-        sample falls back to the default detector.
+        Expected ``data.batch["responses"]`` shape (B, T). Per-sample task is
+        read from ``data.non_tensor_batch["task"]``. For samples routed through
+        the acrostic detector (task=='acrostics' or default-routed neg when
+        default is acrostics), per-sample target is read from
+        ``data.non_tensor_batch["acrostic_target"]`` and **must be a non-empty
+        string** — otherwise we hard-fail with a clear error.
         """
         response_ids = data.batch["responses"]
         batch_size, resp_len = response_ids.shape
         reward_tensor = torch.zeros(batch_size, resp_len, dtype=torch.float32)
 
         tasks = None
+        acr_targets = None
         if hasattr(data, "non_tensor_batch") and data.non_tensor_batch is not None:
             tasks = data.non_tensor_batch.get("task", None)
+            acr_targets = data.non_tensor_batch.get("acrostic_target", None)
 
-        per_detector_z: Dict[str, List[float]] = {k: [] for k in self.detectors}
+        keys = self._detector_keys()
+        per_detector_z: Dict[str, List[float]] = {k: [] for k in keys}
         z_scores: List[float] = []
         z_score_valid: List[bool] = []
 
@@ -240,11 +290,32 @@ class WatermarkZScoreRewardFn:
                     per_detector_z[k].append(-1_000_000.0)
                 continue
 
+            # Fixed-seed detectors (green/initials) run for every sample
             for k, det in self.detectors.items():
                 per_detector_z[k].append(float(det.unidetect(token_list)))
 
+            # Acrostic detector is per-sample (target read from data)
+            if self._acrostic_in_eval:
+                if acr_targets is None:
+                    raise ValueError(
+                        "acrostic in eval_tasks but data.non_tensor_batch has no "
+                        "'acrostic_target' field — fix the val parquet."
+                    )
+                target_i = acr_targets[i]
+                if isinstance(target_i, bytes):
+                    target_i = target_i.decode("utf-8")
+                # numpy object dtype may yield None, NaN, or 'None' string
+                target_i = None if (target_i is None or (isinstance(target_i, float)) or str(target_i) == "None" or str(target_i) == "") else str(target_i)
+                if target_i is None:
+                    raise ValueError(
+                        f"sample {i}: acrostic_target missing/empty in val parquet; "
+                        "all samples (incl. neg) must carry per-sample target."
+                    )
+                acr_det = self._get_acrostic_detector(target_i)
+                per_detector_z["acrostics"].append(float(acr_det.unidetect(token_list)))
+
             task_i = str(tasks[i]) if tasks is not None else None
-            if task_i == "neg" or task_i is None or task_i not in self.detectors:
+            if task_i == "neg" or task_i is None or task_i not in per_detector_z:
                 # neg / unknown / single-task path: use default detector
                 z_sample = per_detector_z[self.default_detector_key][-1]
             else:

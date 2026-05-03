@@ -112,7 +112,9 @@ class TaskRunner:
         from recipe.watermark_rl_ray.reward import PerSampleWatermarkZScoreRewardFn
 
         active_tasks = list(config.reward.get("active_tasks", ["green", "initials"]))
-        acrostics_target = config.reward.get("acrostics_target", "asdf")
+        # NOTE 2026-05-02 refactor: removed all code-level acrostic_target
+        # derivation/fallback. Per-sample target lives in the train+val parquet
+        # under non_tensor_batch['acrostic_target']. Reward fn raises if missing.
         acrostics_n_resample = config.reward.get("acrostics_n_resample", 1000)
         acrostics_detector_kind = config.reward.get("acrostics_detector_kind", "lcs")
 
@@ -123,7 +125,6 @@ class TaskRunner:
             only_english=config.reward.get("only_english", True),
             stats_file=config.reward.get("stats_file", "data/initials_icw/leading_space_first_letter_stats.json"),
             active_tasks=active_tasks,
-            acrostics_target=acrostics_target,
             acrostics_n_resample=acrostics_n_resample,
             acrostics_detector_kind=acrostics_detector_kind,
         )
@@ -141,7 +142,6 @@ class TaskRunner:
             eval_green_seed=config.reward.get("eval_green_seed", 1),
             eval_green_fraction=config.reward.get("eval_green_fraction", 0.25),
             eval_initials_seed=config.reward.get("eval_initials_seed", 0),
-            acrostics_target=acrostics_target,
             acrostics_n_resample=acrostics_n_resample,
             acrostics_detector_kind=acrostics_detector_kind,
         )

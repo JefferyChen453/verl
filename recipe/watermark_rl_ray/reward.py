@@ -57,10 +57,15 @@ class PerSampleWatermarkZScoreRewardFn:
         only_english: bool = True,
         stats_file: str = "data/initials_icw/leading_space_first_letter_stats.json",
         active_tasks: Optional[list] = None,
-        acrostics_target: str = "asdf",
         acrostics_n_resample: int = 1000,
         acrostics_detector_kind: str = "lcs",
     ):
+        """Per-sample reward fn. Acrostic target MUST be in
+        ``data.non_tensor_batch['acrostic_target']`` per sample — no fallback.
+
+        Removed `acrostics_target` constructor param 2026-05-02 to prevent
+        silent target mismatches: every secret string lives in the data only.
+        """
         assert tokenizer is not None
         self.tokenizer = tokenizer
         self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
@@ -69,7 +74,6 @@ class PerSampleWatermarkZScoreRewardFn:
         self.only_english = bool(only_english)
         self.stats_file = stats_file
         self.active_tasks = list(active_tasks) if active_tasks else ["green", "initials"]
-        self.acrostics_target = acrostics_target
         self.acrostics_n_resample = int(acrostics_n_resample)
         if acrostics_detector_kind not in ("hits", "lcs"):
             raise ValueError(f"acrostics_detector_kind must be 'hits' or 'lcs', got {acrostics_detector_kind!r}")
@@ -86,8 +90,12 @@ class PerSampleWatermarkZScoreRewardFn:
         """
         frac_key = _round_frac(fraction)
         if task == "acrostics":
-            t = target if target else self.acrostics_target
-            key = (task, t)        # acrostics detector keyed on target only
+            if not isinstance(target, str) or not target:
+                raise ValueError(
+                    f"task=acrostics requires non-empty per-sample target; got {target!r}. "
+                    "Fix the parquet to populate acrostic_target."
+                )
+            key = (task, target)        # acrostics detector keyed on target only
         else:
             key = (task, int(seed), frac_key)
         if key in self._cache:
@@ -124,9 +132,9 @@ class PerSampleWatermarkZScoreRewardFn:
             # (extractor='md', no strict regex). Default kind='lcs' picks the
             # production detector validated on test_477 (AUC 0.94→0.99).
             from recipe.watermark_kd_ray.reward import _build_acrostics_detector
-            t = target if target else self.acrostics_target
+            # target was validated as non-empty above
             det = _build_acrostics_detector(
-                target=t,
+                target=target,
                 tokenizer=self.tokenizer,
                 n_resample=self.acrostics_n_resample,
                 kind=self.acrostics_detector_kind,
@@ -157,7 +165,13 @@ class PerSampleWatermarkZScoreRewardFn:
             seed = int(wm_seeds[i])
             frac = float(wm_fracs[i])
             target = acr_targets[i] if i < len(acr_targets) else None
-            target = str(target) if target and str(target) != "None" else None
+            if isinstance(target, bytes):
+                target = target.decode("utf-8")
+            target = str(target) if (target is not None and str(target) not in ("None", "")) else None
+            if task == "acrostics" and target is None:
+                raise ValueError(
+                    f"sample {i}: task=acrostics but acrostic_target missing in parquet"
+                )
 
             ids = responses[i].tolist()
             token_list = [t for t in ids if t != self.pad_token_id]

@@ -53,7 +53,9 @@ from recipe.watermark_kd_ray.trainer import WatermarkKDRayTrainer
 
 # Non-tensor batch keys that must survive rollout (they're popped by _get_gen_batch
 # into gen_batch but not restored by gen_batch.union with rollout output).
-_PASSTHROUGH_KEYS = ("wm_seed", "wm_fraction", "task")
+# acrostic_target added 2026-05-02 — required by per-sample acrostic detector
+# in PerSampleWatermarkZScoreRewardFn (no fallback to a fixed default anymore).
+_PASSTHROUGH_KEYS = ("wm_seed", "wm_fraction", "task", "acrostic_target")
 
 
 class WatermarkRLTrainer(WatermarkKDRayTrainer):
